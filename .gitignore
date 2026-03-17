@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Venv
+.venv/
+
+# Millwright data
+millwright_data/
+
+# Nix
+result
+result-*
+
+# IDE
+.idea/
+.vscode/
+*.swp
