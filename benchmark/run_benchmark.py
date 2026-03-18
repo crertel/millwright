@@ -1,12 +1,14 @@
 """Entry point: python -m benchmark.run_benchmark"""
 
-import sys
+import argparse
 import time
+from pathlib import Path
 
+from .report import generate_html_report
 from .simulation import run_simulation
 
 
-def format_table(results: list[dict]) -> str:
+def format_table(results: list[dict], label: str = "") -> str:
     """Format results as a readable table."""
     lines = []
 
@@ -17,7 +19,10 @@ def format_table(results: list[dict]) -> str:
     separator = "-" * len(header)
 
     lines.append("")
-    lines.append("Millwright Benchmark Results")
+    title = f"Millwright Benchmark Results"
+    if label:
+        title += f" ({label})"
+    lines.append(title)
     lines.append("=" * len(header))
     lines.append(header)
     lines.append(separator)
@@ -35,7 +40,6 @@ def format_table(results: list[dict]) -> str:
 
     lines.append(separator)
 
-    # Summary: round 1 vs round 10
     r1 = results[0]["overall"]
     r_last = results[-1]["overall"]
     lines.append("")
@@ -51,36 +55,40 @@ def format_table(results: list[dict]) -> str:
             f"(delta: {delta:+.3f}, {pct:+.1f}%)"
         )
 
-    # Tier 3 (ambiguous) improvement
-    t3_r1 = results[0]["tier_3"]
-    t3_rn = results[-1]["tier_3"]
-    lines.append("")
-    lines.append("Tier 3 (Ambiguous) Improvement:")
-    for metric in ["mrr", "p@1"]:
-        v1 = t3_r1[metric]
-        vn = t3_rn[metric]
-        delta = vn - v1
-        pct = (delta / v1 * 100) if v1 > 0 else float("inf")
-        lines.append(
-            f"  {metric.upper():>5}: {v1:.3f} -> {vn:.3f}  "
-            f"(delta: {delta:+.3f}, {pct:+.1f}%)"
-        )
-
     lines.append("")
     return "\n".join(lines)
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Millwright benchmark")
+    parser.add_argument("--rounds", type=int, default=10, help="Number of rounds")
+    parser.add_argument("--seeds", type=int, default=3, help="Number of random seeds")
+    parser.add_argument("--noise", type=float, default=0.0, help="Feedback noise (0.0-1.0)")
+    parser.add_argument("--seed", type=int, default=42, help="Base random seed")
+    parser.add_argument("-o", "--output", type=str, default="benchmark_report.html")
+    args = parser.parse_args()
+
     print("Millwright Benchmark")
-    print("Loading model and running simulation...")
+    print(f"  Rounds: {args.rounds}, Seeds: {args.seeds}, Noise: {args.noise}")
+    print("  Loading model and running simulation...")
     print()
 
     start = time.time()
-    results = run_simulation(n_rounds=10, seed=42)
+    data = run_simulation(
+        n_rounds=args.rounds,
+        seed=args.seed,
+        n_seeds=args.seeds,
+        feedback_noise=args.noise,
+    )
     elapsed = time.time() - start
 
-    print(format_table(results))
+    print(format_table(data["adaptive"], "Adaptive"))
+    print(format_table(data["baseline"], "Baseline (semantic-only)"))
     print(f"Completed in {elapsed:.1f}s")
+
+    report_path = Path(args.output)
+    report_path.write_text(generate_html_report(data, elapsed))
+    print(f"HTML report written to {report_path}")
 
 
 if __name__ == "__main__":
