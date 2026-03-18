@@ -4,6 +4,8 @@ import html
 import json
 from datetime import datetime
 
+MILESTONES = [1, 5, 10, 25, 50, 100]
+
 
 def _improvement_row(label: str, v1: float, vn: float) -> str:
     delta = vn - v1
@@ -17,7 +19,7 @@ def _improvement_row(label: str, v1: float, vn: float) -> str:
     )
 
 
-def _build_chart_data(results: dict) -> str:
+def _build_chart_data(results: dict, sweep: list[dict] | None, fitness: list[dict] | None) -> str:
     """Build a JSON blob with all data D3 needs."""
     adaptive = results["adaptive"]
     baseline = results["baseline"]
@@ -52,32 +54,77 @@ def _build_chart_data(results: dict) -> str:
             "t3_p1": extract_series(baseline, "tier_3", "p@1"),
         },
     }
+
+    if sweep:
+        chart_data["sweep"] = []
+        for entry in sweep:
+            final = entry["rounds"][-1]
+            chart_data["sweep"].append({
+                "label": entry["label"],
+                "sw": entry["semantic_weight"],
+                "hw": entry["historical_weight"],
+                "overall_mrr": final["overall"]["mrr"],
+                "t1_mrr": final["tier_1"]["mrr"],
+                "t2_mrr": final["tier_2"]["mrr"],
+                "t3_mrr": final["tier_3"]["mrr"],
+                "overall_p1": final["overall"]["p@1"],
+                "t3_p1": final["tier_3"]["p@1"],
+            })
+
+    if fitness:
+        chart_data["fitness"] = []
+        for entry in fitness:
+            final = entry["rounds"][-1]
+            chart_data["fitness"].append({
+                "label": entry["label"],
+                "preset": entry["preset"],
+                "overall_mrr": final["overall"]["mrr"],
+                "t1_mrr": final["tier_1"]["mrr"],
+                "t2_mrr": final["tier_2"]["mrr"],
+                "t3_mrr": final["tier_3"]["mrr"],
+                "overall_p1": final["overall"]["p@1"],
+                "t3_p1": final["tier_3"]["p@1"],
+                "overall_hit5": final["overall"]["hit@5"],
+            })
+
     return json.dumps(chart_data)
 
 
-def generate_html_report(results: dict, elapsed: float) -> str:
+def generate_html_report(
+    results: dict,
+    sweep: list[dict] | None,
+    fitness: list[dict] | None,
+    elapsed: float,
+    n_tools: int = 30,
+    n_queries: int = 50,
+    n_categories: int = 6,
+    tier_counts: tuple[int, int, int] = (20, 15, 15),
+) -> str:
     adaptive = results["adaptive"]
     baseline = results["baseline"]
     n_seeds = results["n_seeds"]
     noise = results["feedback_noise"]
     multi = n_seeds > 1
+    n_rounds = len(adaptive)
+    t1_count, t2_count, t3_count = tier_counts
 
     r1 = adaptive[0]
     r_last = adaptive[-1]
     b_last = baseline[-1]
 
-    chart_json = _build_chart_data(results)
+    chart_json = _build_chart_data(results, sweep, fitness)
 
-    # Metrics table rows
-    table_rows = []
+    # Milestone table rows (subset of rounds)
+    milestone_rounds = [m for m in MILESTONES if m <= n_rounds]
+    milestone_rows = []
     for r in adaptive:
+        if r["round"] not in milestone_rounds:
+            continue
         o, t1, t2, t3 = r["overall"], r["tier_1"], r["tier_2"], r["tier_3"]
-        std_suffix = ""
+        std_suffix_mrr = ""
         if multi:
             std_suffix_mrr = f' <span class="std">&plusmn;{r["overall_std"]["mrr"]:.3f}</span>'
-        else:
-            std_suffix_mrr = ""
-        table_rows.append(
+        milestone_rows.append(
             f"<tr><td>{r['round']}</td>"
             f"<td>{o['mrr']:.3f}{std_suffix_mrr}</td><td>{o['p@1']:.3f}</td>"
             f"<td>{o['p@3']:.3f}</td><td>{o['p@5']:.3f}</td><td>{o['hit@5']:.3f}</td>"
@@ -111,9 +158,175 @@ def generate_html_report(results: dict, elapsed: float) -> str:
             label, b_last["overall"][metric], r_last["overall"][metric]
         ))
 
+    # Weight sweep table rows
+    sweep_table = ""
+    if sweep:
+        sweep_rows = []
+        best_mrr = max(e["rounds"][-1]["overall"]["mrr"] for e in sweep)
+        for entry in sweep:
+            final = entry["rounds"][-1]
+            o = final["overall"]
+            t3 = final["tier_3"]
+            is_best = o["mrr"] == best_mrr
+            cls = ' class="best-row"' if is_best else ""
+            sweep_rows.append(
+                f"<tr{cls}><td>{entry['label']}</td>"
+                f"<td>{o['mrr']:.3f}</td><td>{o['p@1']:.3f}</td>"
+                f"<td>{o['p@3']:.3f}</td><td>{o['hit@5']:.3f}</td>"
+                f"<td>{t3['mrr']:.3f}</td><td>{t3['p@1']:.3f}</td></tr>"
+            )
+        sweep_rounds = len(sweep[0]["rounds"])
+        sweep_table = f"""
+<table>
+<thead><tr>
+  <th>Sem / Hist</th><th>MRR</th><th>P@1</th><th>P@3</th><th>Hit@5</th>
+  <th>T3 MRR</th><th>T3 P@1</th>
+</tr></thead>
+<tbody>{"".join(sweep_rows)}</tbody>
+</table>"""
+
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     seeds_note = f" &middot; {n_seeds} seeds averaged" if multi else ""
     noise_note = f" &middot; {noise:.0%} feedback noise" if noise > 0 else ""
+
+    # Sweep section HTML
+    sweep_section = ""
+    if sweep:
+        sweep_rounds = len(sweep[0]["rounds"])
+        sweep_section = f"""
+<!-- ============================================================ -->
+<h2>Weight Sweep</h2>
+<p>
+  How should Millwright balance semantic similarity against historical fitness? This sweep tests
+  9 weight ratios from pure semantic (1.0/0.0) to heavily historical (0.2/0.8), each run for
+  {sweep_rounds} rounds. The goal is to find the blend that maximizes final-round performance.
+</p>
+
+<div class="charts">
+  <div class="chart-card"><div id="chart-sweep-mrr"></div>
+    <p class="caption">
+      Final-round MRR at each weight ratio, broken out by tier. The peak shows the optimal
+      balance point. Too little historical weight (left) misses learning signal; too much
+      (right) under-weights the semantic prior, hurting cold-start and direct-match queries.
+    </p>
+  </div>
+  <div class="chart-card"><div id="chart-sweep-p1"></div>
+    <p class="caption">
+      Final-round Precision@1 overall and for Tier 3 (ambiguous). P@1 is more sensitive to
+      weight changes because it depends on the single top-ranked tool. The optimal P@1 ratio
+      may differ slightly from optimal MRR.
+    </p>
+  </div>
+</div>
+
+<h3>Sweep Results (after {sweep_rounds} rounds)</h3>
+<p>
+  Each row shows final-round metrics for one weight configuration. The highlighted row has the
+  highest overall MRR. Note that pure semantic (1.0/0.0) is effectively the baseline &mdash;
+  historical signal has zero weight regardless of accumulated feedback.
+</p>
+{sweep_table}
+
+<div class="note">
+  <strong>Interpretation:</strong> The sweep reveals how much weight the system can productively
+  give to historical feedback. If the optimal ratio shifts right of 0.6/0.4 with more rounds
+  (as the review index grows richer), it suggests the system would benefit from dynamic weight
+  scheduling &mdash; starting semantic-heavy and gradually increasing historical weight as
+  confidence in the feedback signal grows.
+</div>
+"""
+
+    # Fitness section HTML
+    fitness_section = ""
+    if fitness:
+        fitness_rounds = len(fitness[0]["rounds"])
+        fitness_rows = []
+        best_mrr = max(e["rounds"][-1]["overall"]["mrr"] for e in fitness)
+        for entry in fitness:
+            final = entry["rounds"][-1]
+            o = final["overall"]
+            t3 = final["tier_3"]
+            p = entry["preset"]
+            is_best = o["mrr"] == best_mrr
+            cls = ' class="best-row"' if is_best else ""
+            fitness_rows.append(
+                f"<tr{cls}><td>{html.escape(entry['label'])}</td>"
+                f"<td>{p['perfect']:.1f}</td><td>{p['related']:.2f}</td>"
+                f"<td>{p['unrelated']:.2f}</td><td>{p['broken']:.2f}</td>"
+                f"<td>{o['mrr']:.3f}</td><td>{o['p@1']:.3f}</td>"
+                f"<td>{o['hit@5']:.3f}</td>"
+                f"<td>{t3['mrr']:.3f}</td><td>{t3['p@1']:.3f}</td></tr>"
+            )
+        fitness_table = f"""
+<table>
+<thead><tr>
+  <th>Preset</th><th>Perfect</th><th>Related</th><th>Unrel.</th><th>Broken</th>
+  <th>MRR</th><th>P@1</th><th>Hit@5</th><th>T3 MRR</th><th>T3 P@1</th>
+</tr></thead>
+<tbody>{"".join(fitness_rows)}</tbody>
+</table>"""
+
+        fitness_section = f"""
+<!-- ============================================================ -->
+<h2>Fitness Multiplier Sweep</h2>
+<p>
+  When the agent reviews a suggested tool, the rating is converted to a fitness multiplier that
+  scales the tool&rsquo;s historical score for similar queries. But how aggressive should these
+  multipliers be? This sweep tests 8 presets ranging from &ldquo;Flat&rdquo; (all 1.0, no learning
+  signal) to &ldquo;Extreme&rdquo; (3.0/1.2/0.3/0.05), each run for {fitness_rounds} rounds.
+</p>
+
+<p>
+  The four multipliers are:
+</p>
+<dl>
+  <dt>Perfect</dt>
+  <dd>Applied when the suggested tool is exactly what the agent needed. Higher values cause
+  the system to more aggressively promote tools that have worked before.</dd>
+  <dt>Related</dt>
+  <dd>Applied when a same-category tool is suggested (e.g., db_insert when db_query was wanted).
+  Values above 1.0 treat near-misses as weak positive signal; below 1.0 treats them as noise.</dd>
+  <dt>Unrelated</dt>
+  <dd>Applied when a wrong-category tool is suggested. Lower values more aggressively demote
+  tools that appeared in irrelevant contexts.</dd>
+  <dt>Broken</dt>
+  <dd>Applied when a tool is reported as non-functional. The harshest penalty &mdash; though in
+  this benchmark, no tools are broken, so this tests robustness of the preset overall.</dd>
+</dl>
+
+<div class="charts">
+  <div class="chart-card"><div id="chart-fitness-mrr"></div>
+    <p class="caption">
+      Final-round MRR by preset. &ldquo;Flat&rdquo; is the control &mdash; all multipliers are 1.0,
+      so historical feedback has no effect even though it&rsquo;s collected. The gap between Flat
+      and the best preset shows the value of tuned fitness multipliers.
+    </p>
+  </div>
+  <div class="chart-card"><div id="chart-fitness-p1"></div>
+    <p class="caption">
+      Precision@1 and Tier 3 P@1. The &ldquo;related&rdquo; multiplier is especially interesting:
+      &ldquo;Punitive related&rdquo; (0.9) treats same-category tools as slightly wrong,
+      while &ldquo;Generous related&rdquo; (1.3) gives them strong credit. The difference
+      reveals whether category proximity is useful signal or noise.
+    </p>
+  </div>
+</div>
+
+<h3>Fitness Sweep Results (after {fitness_rounds} rounds)</h3>
+<p>
+  Each row shows one preset&rsquo;s multiplier values and final-round metrics. The highlighted
+  row has the highest overall MRR.
+</p>
+{fitness_table}
+
+<div class="note">
+  <strong>Interpretation:</strong> Wider spreads generally help &mdash; they give the system a
+  stronger learning signal per review. But going too extreme can cause the system to over-commit
+  to early feedback before it has seen enough data. The &ldquo;related&rdquo; multiplier is the
+  most nuanced lever: treating same-category tools as positive signal (above 1.0) helps when
+  categories are semantically meaningful, but can hurt if categories are arbitrary groupings.
+</div>
+"""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -148,6 +361,8 @@ def generate_html_report(results: dict, elapsed: float) -> str:
   tbody tr:hover {{ background: #f9fafb; }}
   .baseline-row {{ background: #fefce8; }}
   .baseline-row:hover {{ background: #fef9c3 !important; }}
+  .best-row {{ background: #f0fdf4; }}
+  .best-row:hover {{ background: #dcfce7 !important; }}
   .std {{ color: #9ca3af; font-size: 0.75rem; }}
   .summary {{ display: flex; gap: 1.5rem; flex-wrap: wrap; }}
   .summary > div {{ flex: 1 1 300px; }}
@@ -162,7 +377,7 @@ def generate_html_report(results: dict, elapsed: float) -> str:
   .tier-card .example {{ font-style: italic; color: #6b7280; font-size: 0.8125rem; }}
   .tooltip {{ position: absolute; background: #1f2937; color: #fff; padding: 6px 10px;
               border-radius: 6px; font-size: 12px; pointer-events: none; opacity: 0;
-              transition: opacity 0.15s; white-space: nowrap; }}
+              transition: opacity 0.15s; white-space: nowrap; z-index: 10; }}
   svg text {{ font-family: system-ui, -apple-system, sans-serif; }}
   .grid line {{ stroke: #e5e7eb; }}
   .grid .domain {{ display: none; }}
@@ -177,8 +392,8 @@ def generate_html_report(results: dict, elapsed: float) -> str:
 <div class="tooltip" id="tooltip"></div>
 
 <h1>Millwright Benchmark Report</h1>
-<p class="meta">{timestamp} &middot; {len(adaptive)} rounds &middot; 50 queries &middot;
-30 tools &middot; {elapsed:.1f}s{seeds_note}{noise_note}</p>
+<p class="meta">{timestamp} &middot; {n_rounds} rounds &middot; {n_queries} queries &middot;
+{n_tools} tools &middot; {n_categories} domains &middot; {elapsed:.1f}s{seeds_note}{noise_note}</p>
 
 <!-- ============================================================ -->
 <h2>What is Millwright?</h2>
@@ -194,7 +409,7 @@ def generate_html_report(results: dict, elapsed: float) -> str:
   The core hypothesis is: <em>with repeated use and feedback, tool selection should get measurably
   better than semantic search alone, especially for ambiguous queries where pure matching struggles.</em>
   This benchmark tests that hypothesis by comparing an adaptive system against a frozen
-  semantic-only baseline.
+  semantic-only baseline over {n_rounds} rounds.
 </p>
 
 <!-- ============================================================ -->
@@ -202,31 +417,34 @@ def generate_html_report(results: dict, elapsed: float) -> str:
 
 <h3>Tool Catalog</h3>
 <p>
-  The benchmark uses <strong>30 synthetic tools</strong> spread across 6 domains: file operations,
-  HTTP, database, text processing, data transformation, and system utilities. Each tool has a
-  name, natural-language description, and category label. This mirrors a realistic agent setup
-  where tools come from different providers and have varying description quality.
+  The benchmark uses <strong>{n_tools} synthetic tools</strong> spread across {n_categories} domains
+  (file operations, HTTP, database, text processing, data transformation, system utilities,
+  authentication, cryptography, messaging, media processing, monitoring, and cloud infrastructure).
+  Each tool has a name, natural-language description, and category label. Descriptions are
+  intentionally varied in style &mdash; some terse, some verbose, some jargon-heavy &mdash; to
+  mirror a realistic agent setup where tools come from different providers and have varying
+  description quality.
 </p>
 
 <h3>Query Tiers</h3>
 <p>
-  50 queries are divided into three difficulty tiers to isolate where learning helps most:
+  {n_queries} queries are divided into three difficulty tiers to isolate where learning helps most:
 </p>
 <div class="tier-grid">
   <div class="tier-card">
-    <h4>Tier 1 &mdash; Direct (20 queries)</h4>
+    <h4>Tier 1 &mdash; Direct ({t1_count} queries)</h4>
     <p>Queries that closely match a single tool&rsquo;s description. Semantic search alone
     should handle these well.</p>
     <p class="example">Example: &ldquo;read a file&rdquo; &rarr; file_read</p>
   </div>
   <div class="tier-card">
-    <h4>Tier 2 &mdash; Indirect (15 queries)</h4>
+    <h4>Tier 2 &mdash; Indirect ({t2_count} queries)</h4>
     <p>Rephrased or colloquial queries where the intent maps to a tool but the wording
     differs significantly from the tool description.</p>
     <p class="example">Example: &ldquo;check what&rsquo;s inside this document&rdquo; &rarr; file_read</p>
   </div>
   <div class="tier-card">
-    <h4>Tier 3 &mdash; Ambiguous (15 queries)</h4>
+    <h4>Tier 3 &mdash; Ambiguous ({t3_count} queries)</h4>
     <p>Vague queries where multiple tools could be correct. These are the hardest &mdash;
     semantic similarity alone can&rsquo;t reliably pick the right tool, so historical
     feedback should provide the biggest lift.</p>
@@ -236,7 +454,7 @@ def generate_html_report(results: dict, elapsed: float) -> str:
 
 <h3>Simulation Loop</h3>
 <p>
-  The benchmark runs <strong>{len(adaptive)} rounds</strong>. In each round, all 50 queries are
+  The benchmark runs <strong>{n_rounds} rounds</strong>. In each round, all {n_queries} queries are
   presented in shuffled order. For each query, Millwright suggests its top-k tools. A simulated
   agent then provides feedback: tools matching the ground truth are rated <strong>perfect</strong>
   (fitness multiplier 1.4&times;), tools in the same category are rated <strong>related</strong>
@@ -287,9 +505,11 @@ def generate_html_report(results: dict, elapsed: float) -> str:
 
 <h3>Learning Curves</h3>
 <p>
-  The charts below show how each metric evolves over rounds. Solid lines are the adaptive
-  system; dashed lines are the semantic-only baseline. Upward separation between the two
-  demonstrates that historical feedback is improving tool selection.
+  The charts below show how each metric evolves over {n_rounds} rounds. Solid lines are the
+  adaptive system; dashed lines are the semantic-only baseline. Upward separation between the
+  two demonstrates that historical feedback is improving tool selection. Look for the
+  characteristic shape: rapid improvement in early rounds as the system accumulates initial
+  feedback, then a plateau as returns diminish.
 </p>
 
 <div class="charts">
@@ -317,18 +537,19 @@ def generate_html_report(results: dict, elapsed: float) -> str:
   </div>
 </div>
 
-<h3>Per-Round Metrics Table</h3>
+<h3>Milestone Metrics</h3>
 <p>
-  The full numbers behind the charts. The highlighted &ldquo;Baseline&rdquo; row shows final
-  semantic-only performance for comparison. T1/T2/T3 MRR columns show MRR broken out by
-  difficulty tier.
+  Key checkpoints from the learning curve. The highlighted &ldquo;Baseline&rdquo; row shows
+  the semantic-only system for comparison. Watch how each tier converges at different rates
+  &mdash; Tier 1 is already perfect, Tier 2 improves quickly, and Tier 3 shows the longest
+  learning tail.
 </p>
 <table>
 <thead><tr>
   <th>Round</th><th>MRR</th><th>P@1</th><th>P@3</th><th>P@5</th><th>Hit@5</th>
   <th>T1 MRR</th><th>T2 MRR</th><th>T3 MRR</th>
 </tr></thead>
-<tbody>{"".join(table_rows)}{baseline_row}</tbody>
+<tbody>{"".join(milestone_rows)}{baseline_row}</tbody>
 </table>
 
 <!-- ============================================================ -->
@@ -338,7 +559,7 @@ def generate_html_report(results: dict, elapsed: float) -> str:
 <div>
 <h3>Round 1 &rarr; Round {r_last['round']} (Learning Over Time)</h3>
 <p style="font-size:0.8125rem;color:#6b7280">
-  Shows how much the adaptive system improved from cold start to final round.
+  How much the adaptive system improved from cold start to final round.
 </p>
 <table>
 <thead><tr><th>Metric</th><th>Round 1</th><th>Round {r_last['round']}</th><th>Change</th></tr></thead>
@@ -348,8 +569,8 @@ def generate_html_report(results: dict, elapsed: float) -> str:
 <div>
 <h3>Baseline vs. Adaptive (Value of Feedback)</h3>
 <p style="font-size:0.8125rem;color:#6b7280">
-  Compares final semantic-only baseline against final adaptive performance.
-  This isolates the contribution of historical learning.
+  Final semantic-only baseline against final adaptive performance.
+  Isolates the contribution of historical learning.
 </p>
 <table>
 <thead><tr><th>Metric</th><th>Baseline</th><th>Adaptive</th><th>Change</th></tr></thead>
@@ -361,7 +582,7 @@ def generate_html_report(results: dict, elapsed: float) -> str:
 <h3 style="margin-top:1.5rem">Tier 3 (Ambiguous) &mdash; Where Learning Matters Most</h3>
 <p>
   Ambiguous queries are where semantic search alone is weakest and where historical feedback
-  should provide the biggest lift. The numbers confirm this:
+  should provide the biggest lift:
 </p>
 <table style="max-width:500px">
 <thead><tr><th>Metric</th><th>Round 1</th><th>Round {r_last['round']}</th><th>Change</th></tr></thead>
@@ -376,6 +597,10 @@ def generate_html_report(results: dict, elapsed: float) -> str:
   which tool the agent actually wants.
 </div>
 
+{sweep_section}
+
+{fitness_section}
+
 <!-- ============================================================ -->
 <!-- D3 Charts -->
 <script>
@@ -385,11 +610,14 @@ const COLORS = {{
   baseline: "#94a3b8", hit5: "#2563eb", p3: "#16a34a", p5: "#9333ea"
 }};
 
+const tooltip = d3.select("#tooltip");
+
 function lineChart(container, config) {{
   const {{ series, title, width = 500, height = 280 }} = config;
   const margin = {{ top: 32, right: 20, bottom: 36, left: 48 }};
   const w = width - margin.left - margin.right;
   const h = height - margin.top - margin.bottom;
+  const nRounds = DATA.rounds.length;
 
   const svg = d3.select(container).append("svg")
     .attr("viewBox", `0 0 ${{width}} ${{height}}`)
@@ -403,7 +631,7 @@ function lineChart(container, config) {{
     .attr("fill", "#1f2937").text(title);
 
   // Scales
-  const x = d3.scaleLinear().domain([1, DATA.rounds.length]).range([0, w]);
+  const x = d3.scaleLinear().domain([1, nRounds]).range([0, w]);
   const allVals = series.flatMap(s => s.values);
   const yMin = d3.min(allVals) * 0.95;
   const yMax = Math.min(d3.max(allVals) * 1.02, 1.0);
@@ -413,17 +641,24 @@ function lineChart(container, config) {{
   g.append("g").attr("class", "grid")
     .call(d3.axisLeft(y).ticks(5).tickSize(-w).tickFormat(""));
 
-  // Axes
+  // Axes — smart tick count for large round counts
+  const xTicks = nRounds <= 15 ? nRounds : Math.min(10, nRounds);
   g.append("g").attr("class", "axis").attr("transform", `translate(0,${{h}})`)
-    .call(d3.axisBottom(x).ticks(DATA.rounds.length).tickFormat(d => `R${{d}}`));
+    .call(d3.axisBottom(x).ticks(xTicks).tickFormat(d => d));
   g.append("g").attr("class", "axis")
     .call(d3.axisLeft(y).ticks(5).tickFormat(d3.format(".2f")));
 
-  const tooltip = d3.select("#tooltip");
+  // X axis label
+  g.append("text").attr("x", w / 2).attr("y", h + 32)
+    .attr("text-anchor", "middle").attr("fill", "#9ca3af").attr("font-size", 11).text("Round");
+
   const line = d3.line().x((d, i) => x(i + 1)).y(d => y(d));
 
+  // Decide whether to show individual dots (cluttered above ~20 rounds)
+  const showDots = nRounds <= 25;
+
   series.forEach(s => {{
-    // Confidence band (if std data available)
+    // Confidence band
     if (s.stds && s.stds.some(v => v > 0)) {{
       const area = d3.area()
         .x((d, i) => x(i + 1))
@@ -435,18 +670,22 @@ function lineChart(container, config) {{
 
     // Line
     g.append("path").datum(s.values)
-      .attr("fill", "none").attr("stroke", s.color).attr("stroke-width", 2.5)
+      .attr("fill", "none").attr("stroke", s.color).attr("stroke-width", 2)
       .attr("stroke-dasharray", s.dashed ? "6,3" : "none")
       .attr("d", line);
 
-    // Dots with tooltip
-    g.selectAll(null).data(s.values).enter().append("circle")
-      .attr("cx", (d, i) => x(i + 1)).attr("cy", d => y(d))
-      .attr("r", 4).attr("fill", s.color).attr("stroke", "#fff").attr("stroke-width", 1.5)
+    // Dots (individual or milestone-only)
+    const indices = showDots
+      ? s.values.map((_, i) => i)
+      : [0, 4, 9, 24, 49, 99].filter(i => i < s.values.length);
+
+    g.selectAll(null).data(indices).enter().append("circle")
+      .attr("cx", i => x(i + 1)).attr("cy", i => y(s.values[i]))
+      .attr("r", showDots ? 3.5 : 4).attr("fill", s.color)
+      .attr("stroke", "#fff").attr("stroke-width", 1.5)
       .style("cursor", "pointer")
-      .on("mouseover", function(event, d) {{
-        const i = s.values.indexOf(d);
-        let text = `${{s.label}} R${{i + 1}}: ${{d.toFixed(3)}}`;
+      .on("mouseover", function(event, i) {{
+        let text = `${{s.label}} R${{i + 1}}: ${{s.values[i].toFixed(3)}}`;
         if (s.stds && s.stds[i] > 0) text += ` (\u00b1${{s.stds[i].toFixed(3)}})`;
         tooltip.style("opacity", 1).html(text);
       }})
@@ -516,6 +755,141 @@ lineChart("#chart-hit", {{
        values: DATA.adaptive.overall_p5.values, stds: DATA.adaptive.overall_p5.stds }},
   ]
 }});
+
+// ============================================================
+// Shared grouped bar chart function
+function groupedBarChart(container, config) {{
+  const {{ groups, title, xLabel, width = 500, height = 280 }} = config;
+  const margin = {{ top: 32, right: 20, bottom: 52, left: 48 }};
+  const w = width - margin.left - margin.right;
+  const h = height - margin.top - margin.bottom;
+
+  const svg = d3.select(container).append("svg")
+    .attr("viewBox", `0 0 ${{width}} ${{height}}`)
+    .attr("width", "100%");
+
+  const g = svg.append("g").attr("transform", `translate(${{margin.left}},${{margin.top}})`);
+
+  svg.append("text").attr("x", width / 2).attr("y", 18)
+    .attr("text-anchor", "middle").attr("font-weight", 600).attr("font-size", 14)
+    .attr("fill", "#1f2937").text(title);
+
+  const x0 = d3.scaleBand().domain(groups.map(g => g.label)).range([0, w]).padding(0.2);
+  const barLabels = groups[0].bars.map(b => b.label);
+  const x1 = d3.scaleBand().domain(barLabels).range([0, x0.bandwidth()]).padding(0.08);
+
+  const allVals = groups.flatMap(g => g.bars.map(b => b.value));
+  const yMin = d3.min(allVals) * 0.9;
+  const yMax = Math.min(d3.max(allVals) * 1.05, 1.0);
+  const y = d3.scaleLinear().domain([yMin, yMax]).range([h, 0]).nice();
+
+  g.append("g").attr("class", "grid")
+    .call(d3.axisLeft(y).ticks(5).tickSize(-w).tickFormat(""));
+
+  g.append("g").attr("class", "axis").attr("transform", `translate(0,${{h}})`)
+    .call(d3.axisBottom(x0))
+    .selectAll("text").attr("transform", "rotate(-30)").attr("text-anchor", "end");
+  g.append("g").attr("class", "axis")
+    .call(d3.axisLeft(y).ticks(5).tickFormat(d3.format(".2f")));
+
+  if (xLabel) {{
+    g.append("text").attr("x", w / 2).attr("y", h + 48)
+      .attr("text-anchor", "middle").attr("fill", "#9ca3af").attr("font-size", 11)
+      .text(xLabel);
+  }}
+
+  groups.forEach(group => {{
+    const gGroup = g.append("g").attr("transform", `translate(${{x0(group.label)}},0)`);
+    group.bars.forEach(bar => {{
+      gGroup.append("rect")
+        .attr("x", x1(bar.label)).attr("y", y(bar.value))
+        .attr("width", x1.bandwidth()).attr("height", h - y(bar.value))
+        .attr("fill", bar.color).attr("rx", 2)
+        .on("mouseover", function(event) {{
+          tooltip.style("opacity", 1).html(`${{group.label}} ${{bar.label}}: ${{bar.value.toFixed(3)}}`);
+        }})
+        .on("mousemove", function(event) {{
+          tooltip.style("left", (event.pageX + 12) + "px").style("top", (event.pageY - 28) + "px");
+        }})
+        .on("mouseout", () => tooltip.style("opacity", 0));
+    }});
+  }});
+
+  // Legend
+  const legend = svg.append("g").attr("transform", `translate(${{margin.left + 8}}, ${{margin.top + 4}})`);
+  const uniqueBars = groups[0].bars;
+  uniqueBars.forEach((b, i) => {{
+    const lg = legend.append("g").attr("transform", `translate(${{i * 100}}, 0)`).attr("class", "legend-item");
+    lg.append("rect").attr("width", 12).attr("height", 12).attr("rx", 2).attr("fill", b.color).attr("y", -6);
+    lg.append("text").attr("x", 16).attr("y", 4).attr("font-size", 11).attr("fill", "#374151").text(b.label);
+  }});
+}}
+
+// ============================================================
+// Weight sweep charts
+if (DATA.sweep) {{
+  const sweepGroups = DATA.sweep.map(s => ({{
+    label: s.label,
+    bars: [
+      {{ label: "Overall", value: s.overall_mrr, color: COLORS.overall }},
+      {{ label: "Tier 1", value: s.t1_mrr, color: COLORS.t1 }},
+      {{ label: "Tier 2", value: s.t2_mrr, color: COLORS.t2 }},
+      {{ label: "Tier 3", value: s.t3_mrr, color: COLORS.t3 }},
+    ]
+  }}));
+
+  groupedBarChart("#chart-sweep-mrr", {{
+    title: "Final MRR by Weight Ratio",
+    xLabel: "Semantic / Historical weight",
+    groups: sweepGroups,
+  }});
+
+  const sweepP1Groups = DATA.sweep.map(s => ({{
+    label: s.label,
+    bars: [
+      {{ label: "Overall P@1", value: s.overall_p1, color: COLORS.overall }},
+      {{ label: "Tier 3 P@1", value: s.t3_p1, color: COLORS.t3 }},
+    ]
+  }}));
+
+  groupedBarChart("#chart-sweep-p1", {{
+    title: "Final Precision@1 by Weight Ratio",
+    xLabel: "Semantic / Historical weight",
+    groups: sweepP1Groups,
+  }});
+}}
+
+// ============================================================
+// Fitness sweep charts
+if (DATA.fitness) {{
+  const fitMrrGroups = DATA.fitness.map(f => ({{
+    label: f.label,
+    bars: [
+      {{ label: "Overall", value: f.overall_mrr, color: COLORS.overall }},
+      {{ label: "Tier 1", value: f.t1_mrr, color: COLORS.t1 }},
+      {{ label: "Tier 2", value: f.t2_mrr, color: COLORS.t2 }},
+      {{ label: "Tier 3", value: f.t3_mrr, color: COLORS.t3 }},
+    ]
+  }}));
+
+  groupedBarChart("#chart-fitness-mrr", {{
+    title: "Final MRR by Fitness Preset",
+    groups: fitMrrGroups,
+  }});
+
+  const fitP1Groups = DATA.fitness.map(f => ({{
+    label: f.label,
+    bars: [
+      {{ label: "Overall P@1", value: f.overall_p1, color: COLORS.overall }},
+      {{ label: "Tier 3 P@1", value: f.t3_p1, color: COLORS.t3 }},
+    ]
+  }}));
+
+  groupedBarChart("#chart-fitness-p1", {{
+    title: "Final Precision@1 by Fitness Preset",
+    groups: fitP1Groups,
+  }});
+}}
 </script>
 
 </body>

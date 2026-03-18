@@ -11,9 +11,16 @@ from millwright.embedder import Embedder
 from millwright.models import ToolReview
 from millwright.toolshed import Toolshed, NONE_SENTINEL
 
+from dataclasses import replace
+
 from .queries import BenchmarkQuery, get_queries
 from .metrics import compute_metrics
 from .tools import get_tools
+
+
+def _clone_config(base: MillwrightConfig, **overrides) -> MillwrightConfig:
+    """Clone a config with field overrides."""
+    return replace(base, **overrides)
 
 
 def _simulate_feedback(
@@ -193,3 +200,100 @@ def run_simulation(
         "n_seeds": n_seeds,
         "feedback_noise": feedback_noise,
     }
+
+
+def run_weight_sweep(
+    weights: list[tuple[float, float]] | None = None,
+    n_rounds: int = 10,
+    seed: int = 42,
+    config: MillwrightConfig | None = None,
+    feedback_noise: float = 0.0,
+) -> list[dict]:
+    """Sweep semantic/historical weight ratios.
+
+    Returns a list of dicts, one per weight config:
+      {"semantic_weight", "historical_weight", "label", "rounds": [...]}
+    Each round entry has the same structure as run_simulation adaptive results.
+    """
+    if weights is None:
+        weights = [
+            (1.0, 0.0), (0.9, 0.1), (0.8, 0.2), (0.7, 0.3),
+            (0.6, 0.4), (0.5, 0.5), (0.4, 0.6), (0.3, 0.7), (0.2, 0.8),
+        ]
+
+    base_config = config or MillwrightConfig()
+    tools = get_tools()
+    tool_categories = {t.name: t.category for t in tools}
+    queries = get_queries()
+    embedder = Embedder(base_config)
+
+    results = []
+    for sw, hw in weights:
+        cfg = _clone_config(base_config, semantic_weight=sw, historical_weight=hw)
+        rounds = _run_single(
+            n_rounds, seed, cfg, embedder, queries, tool_categories,
+            baseline=False, feedback_noise=feedback_noise,
+        )
+        results.append({
+            "semantic_weight": sw,
+            "historical_weight": hw,
+            "label": f"{sw:.1f}/{hw:.1f}",
+            "rounds": rounds,
+        })
+
+    return results
+
+
+def run_fitness_sweep(
+    presets: dict[str, dict[str, float]] | None = None,
+    n_rounds: int = 10,
+    seed: int = 42,
+    config: MillwrightConfig | None = None,
+    feedback_noise: float = 0.0,
+) -> list[dict]:
+    """Sweep fitness multiplier presets.
+
+    Each preset is a dict mapping rating names to multipliers:
+      {"perfect": float, "related": float, "unrelated": float, "broken": float}
+
+    Returns a list of dicts:
+      {"label", "preset", "rounds": [...]}
+    """
+    if presets is None:
+        presets = {
+            "Flat (no signal)":  {"perfect": 1.0,  "related": 1.0,  "unrelated": 1.0,  "broken": 1.0},
+            "Mild":              {"perfect": 1.2,  "related": 1.0,  "unrelated": 0.9,  "broken": 0.5},
+            "Default":           {"perfect": 1.4,  "related": 1.05, "unrelated": 0.75, "broken": 0.35},
+            "Wide":              {"perfect": 2.0,  "related": 1.1,  "unrelated": 0.5,  "broken": 0.1},
+            "Extreme":           {"perfect": 3.0,  "related": 1.2,  "unrelated": 0.3,  "broken": 0.05},
+            "Punitive related":  {"perfect": 1.4,  "related": 0.9,  "unrelated": 0.75, "broken": 0.35},
+            "Generous related":  {"perfect": 1.4,  "related": 1.3,  "unrelated": 0.75, "broken": 0.35},
+            "Binary":            {"perfect": 2.0,  "related": 1.0,  "unrelated": 0.5,  "broken": 0.5},
+        }
+
+    base_config = config or MillwrightConfig()
+    tools = get_tools()
+    tool_categories = {t.name: t.category for t in tools}
+    queries = get_queries()
+    embedder = Embedder(base_config)
+
+    results = []
+    for label, preset in presets.items():
+        cfg = _clone_config(
+            base_config,
+            fitness_perfect=preset["perfect"],
+            fitness_related=preset["related"],
+            fitness_unrelated=preset["unrelated"],
+            fitness_broken=preset["broken"],
+        )
+        rounds = _run_single(
+            n_rounds, seed, cfg, embedder, queries, tool_categories,
+            baseline=False, feedback_noise=feedback_noise,
+        )
+        results.append({
+            "label": label,
+            "preset": preset,
+            "rounds": rounds,
+        })
+
+    return results
