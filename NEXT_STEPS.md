@@ -16,6 +16,10 @@ Tools and queries are fixed for the entire run. No testing of stale reviews for 
 
 The benchmark uses `MockDecomposer` (naive conjunction splitting). Per-subquery storage is mostly 1:1 with mock decomposition, so its value is untested. Options: add a mode using `ClaudeDecomposer` (requires API key), or use a cached/precomputed decomposition set.
 
+### Spec gap: vector store for embedding lookup
+
+The original post calls for a vector store: "vector SQLite or `pg_vector` is enough — larger scenarios would want something like Pinecone or Clickhouse." Currently `semantic_rank()` and `historical_rank()` brute-force loop over all tools/index entries computing dot products, and the review index is a flat JSON file. This is fine at 200 tools but won't scale. Swapping the inner loops for ANN queries against sqlite-vec, pgvector, or FAISS would match the spec without changing the ranking API (functions already return `dict[str, float]`).
+
 ### Spec gap: "create custom tool" option
 
 The original post describes the ability for agents to create new tools when none of the suggestions fit. Not implemented.
