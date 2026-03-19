@@ -7,19 +7,51 @@ from datetime import datetime
 MILESTONES = [1, 5, 10, 25, 50, 100]
 
 
-def _improvement_row(label: str, v1: float, vn: float) -> str:
+def _improvement_row(label: str, v1: float, vn: float, ci: tuple[float, float] | None = None) -> str:
     delta = vn - v1
     pct = (delta / v1 * 100) if v1 > 0 else float("inf")
     arrow = "+" if delta >= 0 else ""
     color = "#16a34a" if delta > 0 else ("#dc2626" if delta < 0 else "#6b7280")
+    ci_html = ""
+    if ci is not None:
+        ci_html = f' <span class="std">[{ci[0]:.3f}, {ci[1]:.3f}]</span>'
     return (
         f"<tr><td>{html.escape(label)}</td>"
-        f"<td>{v1:.3f}</td><td>{vn:.3f}</td>"
+        f"<td>{v1:.3f}</td><td>{vn:.3f}{ci_html}</td>"
         f'<td style="color:{color};font-weight:600">{arrow}{delta:.3f} ({arrow}{pct:.1f}%)</td></tr>'
     )
 
 
-def _build_chart_data(results: dict, sweep: list[dict] | None, fitness: list[dict] | None) -> str:
+def _desc(descriptions: dict[str, str] | None, key: str) -> str:
+    """Look up a description block; return empty string if missing."""
+    if descriptions is None:
+        return ""
+    return descriptions.get(key, "")
+
+
+def _desc_block(descriptions: dict[str, str] | None, key: str, tag: str = "p") -> str:
+    """Wrap a description in an HTML tag if present, else empty string."""
+    text = _desc(descriptions, key)
+    if not text:
+        return ""
+    return f"<{tag}>{text}</{tag}>"
+
+
+def _desc_note(descriptions: dict[str, str] | None, key: str) -> str:
+    """Render a description as a styled note block if present."""
+    text = _desc(descriptions, key)
+    if not text:
+        return ""
+    return f'<div class="note">{text}</div>'
+
+
+def _build_chart_data(
+    results: dict,
+    sweep: list[dict] | None,
+    fitness: list[dict] | None,
+    baselines: list[dict] | None = None,
+    compaction_sweep: list[dict] | None = None,
+) -> str:
     """Build a JSON blob with all data D3 needs."""
     adaptive = results["adaptive"]
     baseline = results["baseline"]
@@ -27,9 +59,16 @@ def _build_chart_data(results: dict, sweep: list[dict] | None, fitness: list[dic
     multi = n_seeds > 1
 
     def extract_series(data, section, metric):
-        vals = [r[section][metric] for r in data]
+        vals = [r[section][metric] for r in data if section in r]
         stds = [r.get(f"{section}_std", {}).get(metric, 0) for r in data] if multi else [0] * len(vals)
-        return {"values": vals, "stds": stds}
+        cis = []
+        for r in data:
+            ci_key = f"{section}_ci"
+            if ci_key in r and metric in r[ci_key]:
+                cis.append(r[ci_key][metric])
+            else:
+                cis.append(None)
+        return {"values": vals, "stds": stds, "cis": cis}
 
     chart_data = {
         "rounds": [r["round"] for r in adaptive],
@@ -54,6 +93,22 @@ def _build_chart_data(results: dict, sweep: list[dict] | None, fitness: list[dic
             "t3_p1": extract_series(baseline, "tier_3", "p@1"),
         },
     }
+
+    # Test-set series (holdout evaluation)
+    if any("test_overall" in r for r in adaptive):
+        chart_data["adaptive_test"] = {
+            "overall_mrr": extract_series(adaptive, "test_overall", "mrr"),
+            "t1_mrr": extract_series(adaptive, "test_tier_1", "mrr"),
+            "t2_mrr": extract_series(adaptive, "test_tier_2", "mrr"),
+            "t3_mrr": extract_series(adaptive, "test_tier_3", "mrr"),
+            "overall_p1": extract_series(adaptive, "test_overall", "p@1"),
+            "overall_hit5": extract_series(adaptive, "test_overall", "hit@5"),
+        }
+        chart_data["adaptive_train"] = {
+            "overall_mrr": extract_series(adaptive, "train_overall", "mrr"),
+            "overall_p1": extract_series(adaptive, "train_overall", "p@1"),
+            "overall_hit5": extract_series(adaptive, "train_overall", "hit@5"),
+        }
 
     if sweep:
         chart_data["sweep"] = []
@@ -87,6 +142,34 @@ def _build_chart_data(results: dict, sweep: list[dict] | None, fitness: list[dic
                 "overall_hit5": final["overall"]["hit@5"],
             })
 
+    if baselines:
+        chart_data["baselines"] = []
+        for entry in baselines:
+            chart_data["baselines"].append({
+                "label": entry["label"],
+                "overall_mrr": entry["metrics"]["overall"]["mrr"],
+                "overall_p1": entry["metrics"]["overall"]["p@1"],
+                "overall_hit5": entry["metrics"]["overall"]["hit@5"],
+                "t1_mrr": entry["metrics"].get("tier_1", {}).get("mrr", 0),
+                "t2_mrr": entry["metrics"].get("tier_2", {}).get("mrr", 0),
+                "t3_mrr": entry["metrics"].get("tier_3", {}).get("mrr", 0),
+            })
+
+    if compaction_sweep:
+        chart_data["compaction"] = []
+        for entry in compaction_sweep:
+            final = entry["rounds"][-1]
+            chart_data["compaction"].append({
+                "label": entry["label"],
+                "compact_every": entry["compact_every"],
+                "overall_mrr": final["overall"]["mrr"],
+                "t1_mrr": final["tier_1"]["mrr"],
+                "t2_mrr": final["tier_2"]["mrr"],
+                "t3_mrr": final["tier_3"]["mrr"],
+                "overall_p1": final["overall"]["p@1"],
+                "t3_p1": final["tier_3"]["p@1"],
+            })
+
     return json.dumps(chart_data)
 
 
@@ -99,6 +182,9 @@ def generate_html_report(
     n_queries: int = 50,
     n_categories: int = 6,
     tier_counts: tuple[int, int, int] = (20, 15, 15),
+    descriptions: dict[str, str] | None = None,
+    baselines: list[dict] | None = None,
+    compaction_sweep: list[dict] | None = None,
 ) -> str:
     adaptive = results["adaptive"]
     baseline = results["baseline"]
@@ -112,7 +198,11 @@ def generate_html_report(
     r_last = adaptive[-1]
     b_last = baseline[-1]
 
-    chart_json = _build_chart_data(results, sweep, fitness)
+    has_holdout = "test_overall" in r_last
+    has_multi_turn = "multi_turn_hit" in r_last.get("overall", {})
+    has_significance = "significance" in results
+
+    chart_json = _build_chart_data(results, sweep, fitness, baselines, compaction_sweep)
 
     # Milestone table rows (subset of rounds)
     milestone_rounds = [m for m in MILESTONES if m <= n_rounds]
@@ -145,7 +235,10 @@ def generate_html_report(
     imp_rows = []
     for metric, label in [("mrr", "MRR"), ("p@1", "P@1"), ("p@3", "P@3"),
                            ("p@5", "P@5"), ("hit@5", "Hit@5")]:
-        imp_rows.append(_improvement_row(label, r1["overall"][metric], r_last["overall"][metric]))
+        ci = None
+        if has_significance and metric in results.get("significance", {}).get("adaptive_final_ci", {}):
+            ci = results["significance"]["adaptive_final_ci"][metric]
+        imp_rows.append(_improvement_row(label, r1["overall"][metric], r_last["overall"][metric], ci))
 
     t3_imp_rows = []
     for metric, label in [("mrr", "MRR"), ("p@1", "P@1"), ("p@3", "P@3")]:
@@ -157,6 +250,31 @@ def generate_html_report(
         avb_rows.append(_improvement_row(
             label, b_last["overall"][metric], r_last["overall"][metric]
         ))
+
+    # Significance test results
+    sig_html = ""
+    if has_significance:
+        sig = results["significance"]
+        sig_rows = []
+        for metric, label in [("mrr", "MRR"), ("p@1", "P@1"), ("hit@5", "Hit@5")]:
+            if metric in sig.get("wilcoxon", {}):
+                w = sig["wilcoxon"][metric]
+                p_val = w["p_value"]
+                star = "*" if p_val < 0.05 else ""
+                color = "#16a34a" if p_val < 0.05 else "#6b7280"
+                sig_rows.append(
+                    f'<tr><td>{label}</td>'
+                    f'<td style="color:{color};font-weight:600">p={p_val:.4f}{star}</td>'
+                    f'<td>{w["statistic"]:.2f}</td></tr>'
+                )
+        if sig_rows:
+            sig_html = f"""
+<h3 style="margin-top:1.5rem">Statistical Significance (Wilcoxon Signed-Rank)</h3>
+<table style="max-width:400px">
+<thead><tr><th>Metric</th><th>p-value</th><th>Statistic</th></tr></thead>
+<tbody>{"".join(sig_rows)}</tbody>
+</table>
+"""
 
     # Weight sweep table rows
     sweep_table = ""
@@ -175,7 +293,6 @@ def generate_html_report(
                 f"<td>{o['p@3']:.3f}</td><td>{o['hit@5']:.3f}</td>"
                 f"<td>{t3['mrr']:.3f}</td><td>{t3['p@1']:.3f}</td></tr>"
             )
-        sweep_rounds = len(sweep[0]["rounds"])
         sweep_table = f"""
 <table>
 <thead><tr>
@@ -189,6 +306,91 @@ def generate_html_report(
     seeds_note = f" &middot; {n_seeds} seeds averaged" if multi else ""
     noise_note = f" &middot; {noise:.0%} feedback noise" if noise > 0 else ""
 
+    # Holdout section
+    holdout_section = ""
+    if has_holdout:
+        test_last = r_last["test_overall"]
+        train_last = r_last["train_overall"]
+        holdout_rows = []
+        for metric, label in [("mrr", "MRR"), ("p@1", "P@1"), ("hit@5", "Hit@5")]:
+            train_v = train_last[metric]
+            test_v = test_last[metric]
+            delta = test_v - train_v
+            color = "#16a34a" if delta >= 0 else "#dc2626"
+            holdout_rows.append(
+                f"<tr><td>{label}</td><td>{train_v:.3f}</td><td>{test_v:.3f}</td>"
+                f'<td style="color:{color}">{delta:+.3f}</td></tr>'
+            )
+        holdout_section = f"""
+<!-- ============================================================ -->
+<h2>Holdout Evaluation</h2>
+{_desc_block(descriptions, "holdout_eval")}
+<div class="charts">
+  <div class="chart-card"><div id="chart-holdout-mrr"></div></div>
+  <div class="chart-card"><div id="chart-holdout-p1"></div></div>
+</div>
+<h3>Train vs. Test (Final Round)</h3>
+<table style="max-width:500px">
+<thead><tr><th>Metric</th><th>Train</th><th>Test (Holdout)</th><th>Gap</th></tr></thead>
+<tbody>{"".join(holdout_rows)}</tbody>
+</table>
+"""
+
+    # Baselines comparison section
+    baselines_section = ""
+    if baselines:
+        bl_rows = []
+        # Add adaptive final round as comparison
+        all_entries = baselines + [{"label": f"Adaptive (R{r_last['round']})", "metrics": {
+            "overall": r_last["overall"],
+            "tier_1": r_last["tier_1"],
+            "tier_2": r_last["tier_2"],
+            "tier_3": r_last["tier_3"],
+        }}]
+        best_mrr = max(e["metrics"]["overall"]["mrr"] for e in all_entries)
+        for entry in all_entries:
+            o = entry["metrics"]["overall"]
+            t3 = entry["metrics"].get("tier_3", {})
+            is_best = o["mrr"] == best_mrr
+            cls = ' class="best-row"' if is_best else ""
+            bl_rows.append(
+                f"<tr{cls}><td>{html.escape(entry['label'])}</td>"
+                f"<td>{o['mrr']:.3f}</td><td>{o['p@1']:.3f}</td>"
+                f"<td>{o.get('hit@5', 0):.3f}</td>"
+                f"<td>{t3.get('mrr', 0):.3f}</td><td>{t3.get('p@1', 0):.3f}</td></tr>"
+            )
+        baselines_section = f"""
+<!-- ============================================================ -->
+<h2>Baseline Comparison</h2>
+{_desc_block(descriptions, "baselines")}
+<div class="charts">
+  <div class="chart-card"><div id="chart-baselines-mrr"></div></div>
+  <div class="chart-card"><div id="chart-baselines-p1"></div></div>
+</div>
+<table>
+<thead><tr><th>Method</th><th>MRR</th><th>P@1</th><th>Hit@5</th><th>T3 MRR</th><th>T3 P@1</th></tr></thead>
+<tbody>{"".join(bl_rows)}</tbody>
+</table>
+"""
+
+    # Multi-turn section
+    multi_turn_section = ""
+    if has_multi_turn:
+        mt_hit = r_last["overall"].get("multi_turn_hit", 0)
+        mt_rounds = r_last["overall"].get("multi_turn_rounds", 0)
+        multi_turn_section = f"""
+<!-- ============================================================ -->
+<h2>Multi-Turn Session Results</h2>
+{_desc_block(descriptions, "multi_turn")}
+<table style="max-width:400px">
+<thead><tr><th>Metric</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td>Multi-turn Hit Rate</td><td>{mt_hit:.3f}</td></tr>
+<tr><td>Avg Rounds to Find Tool</td><td>{mt_rounds:.2f}</td></tr>
+</tbody>
+</table>
+"""
+
     # Sweep section HTML
     sweep_section = ""
     if sweep:
@@ -196,43 +398,21 @@ def generate_html_report(
         sweep_section = f"""
 <!-- ============================================================ -->
 <h2>Slot Holdout Sweep</h2>
-<p>
-  Millwright fuses rankings by interleaving semantic and historical results with a minimum holdout
-  from each signal. This sweep tests 9 slot configurations from pure semantic (S5/H0) to heavily
-  historical (S0/H4), each run for {sweep_rounds} rounds. The holdout guarantees that at least N
-  slots in the top-k come from each ranking signal, preventing one signal from dominating entirely.
-</p>
+{_desc_block(descriptions, "slot_sweep")}
 
 <div class="charts">
   <div class="chart-card"><div id="chart-sweep-mrr"></div>
-    <p class="caption">
-      Final-round MRR at each holdout configuration, broken out by tier. More historical slots
-      help ambiguous queries (T3) but too many hurt direct matches where semantic search excels.
-    </p>
+    {_desc_block(descriptions, "slot_sweep_mrr_caption", "p class='caption'")}
   </div>
   <div class="chart-card"><div id="chart-sweep-p1"></div>
-    <p class="caption">
-      Final-round Precision@1 overall and for Tier 3 (ambiguous). P@1 is more sensitive to
-      slot allocation because it depends on the single top-ranked tool.
-    </p>
+    {_desc_block(descriptions, "slot_sweep_p1_caption", "p class='caption'")}
   </div>
 </div>
 
 <h3>Sweep Results (after {sweep_rounds} rounds)</h3>
-<p>
-  Each row shows final-round metrics for one slot configuration. The highlighted row has the
-  highest overall MRR. Note that S5/H0 is effectively the baseline &mdash; no historical
-  slots are guaranteed regardless of accumulated feedback.
-</p>
 {sweep_table}
 
-<div class="note">
-  <strong>Interpretation:</strong> The holdout determines how many top-k slots are guaranteed from
-  each signal. The candidate pool is assembled with these guarantees, then reranked by a combined
-  score. Too few historical slots (left) means the system rarely surfaces historically-proven tools;
-  too few semantic slots (right) abandons the embedding prior, hurting cold-start and direct matches.
-  The optimal balance reflects how much the system can productively delegate to learned fitness.
-</div>
+{_desc_note(descriptions, "slot_sweep_interpretation")}
 """
 
     # Fitness section HTML
@@ -268,63 +448,61 @@ def generate_html_report(
         fitness_section = f"""
 <!-- ============================================================ -->
 <h2>Fitness Multiplier Sweep</h2>
-<p>
-  When the agent reviews a suggested tool, the rating is converted to a fitness multiplier that
-  scales the tool&rsquo;s historical score for similar queries. But how aggressive should these
-  multipliers be? This sweep tests 8 presets ranging from &ldquo;Flat&rdquo; (all 1.0, no learning
-  signal) to &ldquo;Extreme&rdquo; (3.0/1.2/0.3/0.05), each run for {fitness_rounds} rounds.
-</p>
-
-<p>
-  The four multipliers are:
-</p>
-<dl>
-  <dt>Perfect</dt>
-  <dd>Applied when the suggested tool is exactly what the agent needed. Higher values cause
-  the system to more aggressively promote tools that have worked before.</dd>
-  <dt>Related</dt>
-  <dd>Applied when a same-category tool is suggested (e.g., db_insert when db_query was wanted).
-  Values above 1.0 treat near-misses as weak positive signal; below 1.0 treats them as noise.</dd>
-  <dt>Unrelated</dt>
-  <dd>Applied when a wrong-category tool is suggested. Lower values more aggressively demote
-  tools that appeared in irrelevant contexts.</dd>
-  <dt>Broken</dt>
-  <dd>Applied when a tool is reported as non-functional. The harshest penalty &mdash; though in
-  this benchmark, no tools are broken, so this tests robustness of the preset overall.</dd>
-</dl>
+{_desc_block(descriptions, "fitness_sweep")}
 
 <div class="charts">
   <div class="chart-card"><div id="chart-fitness-mrr"></div>
-    <p class="caption">
-      Final-round MRR by preset. &ldquo;Flat&rdquo; is the control &mdash; all multipliers are 1.0,
-      so historical feedback has no effect even though it&rsquo;s collected. The gap between Flat
-      and the best preset shows the value of tuned fitness multipliers.
-    </p>
+    {_desc_block(descriptions, "fitness_sweep_mrr_caption", "p class='caption'")}
   </div>
   <div class="chart-card"><div id="chart-fitness-p1"></div>
-    <p class="caption">
-      Precision@1 and Tier 3 P@1. The &ldquo;related&rdquo; multiplier is especially interesting:
-      &ldquo;Punitive related&rdquo; (0.9) treats same-category tools as slightly wrong,
-      while &ldquo;Generous related&rdquo; (1.3) gives them strong credit. The difference
-      reveals whether category proximity is useful signal or noise.
-    </p>
+    {_desc_block(descriptions, "fitness_sweep_p1_caption", "p class='caption'")}
   </div>
 </div>
 
 <h3>Fitness Sweep Results (after {fitness_rounds} rounds)</h3>
-<p>
-  Each row shows one preset&rsquo;s multiplier values and final-round metrics. The highlighted
-  row has the highest overall MRR.
-</p>
 {fitness_table}
 
-<div class="note">
-  <strong>Interpretation:</strong> Wider spreads generally help &mdash; they give the system a
-  stronger learning signal per review. But going too extreme can cause the system to over-commit
-  to early feedback before it has seen enough data. The &ldquo;related&rdquo; multiplier is the
-  most nuanced lever: treating same-category tools as positive signal (above 1.0) helps when
-  categories are semantically meaningful, but can hurt if categories are arbitrary groupings.
+{_desc_note(descriptions, "fitness_sweep_interpretation")}
+"""
+
+    # Compaction sweep section
+    compaction_section = ""
+    if compaction_sweep:
+        comp_rounds = len(compaction_sweep[0]["rounds"])
+        comp_rows = []
+        best_mrr = max(e["rounds"][-1]["overall"]["mrr"] for e in compaction_sweep)
+        for entry in compaction_sweep:
+            final = entry["rounds"][-1]
+            o = final["overall"]
+            t3 = final["tier_3"]
+            is_best = o["mrr"] == best_mrr
+            cls = ' class="best-row"' if is_best else ""
+            comp_rows.append(
+                f"<tr{cls}><td>{entry['label']}</td>"
+                f"<td>{o['mrr']:.3f}</td><td>{o['p@1']:.3f}</td>"
+                f"<td>{o['hit@5']:.3f}</td>"
+                f"<td>{t3['mrr']:.3f}</td><td>{t3['p@1']:.3f}</td></tr>"
+            )
+        comp_table = f"""
+<table>
+<thead><tr>
+  <th>Frequency</th><th>MRR</th><th>P@1</th><th>Hit@5</th>
+  <th>T3 MRR</th><th>T3 P@1</th>
+</tr></thead>
+<tbody>{"".join(comp_rows)}</tbody>
+</table>"""
+
+        compaction_section = f"""
+<!-- ============================================================ -->
+<h2>Compaction Frequency Sweep</h2>
+{_desc_block(descriptions, "compaction_sweep")}
+<div class="charts">
+  <div class="chart-card"><div id="chart-compaction-mrr"></div></div>
+  <div class="chart-card"><div id="chart-compaction-p1"></div></div>
 </div>
+<h3>Compaction Sweep Results (after {comp_rounds} rounds)</h3>
+{comp_table}
+{_desc_note(descriptions, "compaction_sweep_interpretation")}
 """
 
     return f"""<!DOCTYPE html>
@@ -394,155 +572,41 @@ def generate_html_report(
 <p class="meta">{timestamp} &middot; {n_rounds} rounds &middot; {n_queries} queries &middot;
 {n_tools} tools &middot; {n_categories} domains &middot; {elapsed:.1f}s{seeds_note}{noise_note}</p>
 
-<!-- ============================================================ -->
-<h2>What is Millwright?</h2>
-<p>
-  Millwright is an adaptive tool selection system for AI agents. When an agent has access to a
-  large catalog of tools, choosing the right one for a given task is itself a hard problem &mdash;
-  especially when tool descriptions are vague or the user&rsquo;s query is ambiguous.
-  Millwright combines <strong>semantic search</strong> (embedding-based similarity between query and tool
-  descriptions) with <strong>historical fitness scores</strong> that improve over time as the agent
-  provides feedback on which tools actually worked.
-</p>
-<p>
-  The core hypothesis is: <em>with repeated use and feedback, tool selection should get measurably
-  better than semantic search alone, especially for ambiguous queries where pure matching struggles.</em>
-  This benchmark tests that hypothesis by comparing an adaptive system against a frozen
-  semantic-only baseline over {n_rounds} rounds.
-</p>
-
-<!-- ============================================================ -->
-<h2>Benchmark Methodology</h2>
-
-<h3>Tool Catalog</h3>
-<p>
-  The benchmark uses <strong>{n_tools} synthetic tools</strong> spread across {n_categories} domains
-  (file operations, HTTP, database, text processing, data transformation, system utilities,
-  authentication, cryptography, messaging, media processing, monitoring, and cloud infrastructure).
-  Each tool has a name, natural-language description, and category label. Descriptions are
-  intentionally varied in style &mdash; some terse, some verbose, some jargon-heavy &mdash; to
-  mirror a realistic agent setup where tools come from different providers and have varying
-  description quality.
-</p>
-
-<h3>Query Tiers</h3>
-<p>
-  {n_queries} queries are divided into three difficulty tiers to isolate where learning helps most:
-</p>
-<div class="tier-grid">
-  <div class="tier-card">
-    <h4>Tier 1 &mdash; Direct ({t1_count} queries)</h4>
-    <p>Queries that closely match a single tool&rsquo;s description. Semantic search alone
-    should handle these well.</p>
-    <p class="example">Example: &ldquo;read a file&rdquo; &rarr; file_read</p>
-  </div>
-  <div class="tier-card">
-    <h4>Tier 2 &mdash; Indirect ({t2_count} queries)</h4>
-    <p>Rephrased or colloquial queries where the intent maps to a tool but the wording
-    differs significantly from the tool description.</p>
-    <p class="example">Example: &ldquo;check what&rsquo;s inside this document&rdquo; &rarr; file_read</p>
-  </div>
-  <div class="tier-card">
-    <h4>Tier 3 &mdash; Ambiguous ({t3_count} queries)</h4>
-    <p>Vague queries where multiple tools could be correct. These are the hardest &mdash;
-    semantic similarity alone can&rsquo;t reliably pick the right tool, so historical
-    feedback should provide the biggest lift.</p>
-    <p class="example">Example: &ldquo;get the data&rdquo; &rarr; db_query, http_get, or file_read</p>
-  </div>
-</div>
-
-<h3>Simulation Loop</h3>
-<p>
-  The benchmark runs <strong>{n_rounds} rounds</strong>. In each round, all {n_queries} queries are
-  presented in shuffled order. For each query, Millwright suggests its top-k tools. A simulated
-  agent then provides feedback: tools matching the ground truth are rated <strong>perfect</strong>
-  (fitness multiplier 1.4&times;), tools in the same category are rated <strong>related</strong>
-  (1.05&times;), and everything else is rated <strong>unrelated</strong> (0.75&times;). After each
-  round, the review log is compacted via K-means clustering to build an efficient review index.
-</p>
-
-<h3>Baseline &amp; Controls</h3>
-<p>
-  To isolate the effect of learning, we run a <strong>semantic-only baseline</strong> in parallel
-  that uses the same queries and shuffle order but <em>never submits feedback</em>. Any
-  improvement in the adaptive run over the baseline is attributable to historical fitness
-  learning, not random variation in query order.
-  {"The results shown are averaged over <strong>" + str(n_seeds) + " random seeds</strong> to reduce variance from shuffle order and epsilon-greedy exploration. Shaded bands in the charts show &plusmn;1 standard deviation." if n_seeds > 1 else ""}
-  {"Feedback noise is set to <strong>" + f"{noise:.0%}" + "</strong> &mdash; with this probability, each rating is degraded one level (perfect&rarr;related, related&rarr;unrelated) to simulate imperfect agent judgment." if noise > 0 else ""}
-</p>
+{_desc_block(descriptions, "intro")}
 
 <!-- ============================================================ -->
 <h2>Metrics Explained</h2>
 <dl>
   <dt>MRR (Mean Reciprocal Rank)</dt>
-  <dd>
-    The average of 1/rank for the first correct tool in the results. If the right tool is ranked
-    #1, MRR for that query is 1.0; if it&rsquo;s #2, MRR is 0.5; #3 is 0.33, and so on.
-    <strong>This is the single most important metric</strong> &mdash; it captures how quickly the
-    agent finds the right tool. Higher is better; 1.0 is perfect.
-  </dd>
-
+  <dd>Average of 1/rank for the first correct tool. 1.0 is perfect.</dd>
   <dt>Precision@k (P@1, P@3, P@5)</dt>
-  <dd>
-    The fraction of the top-k results that are correct. P@1 answers &ldquo;did we get it right
-    on the first try?&rdquo; P@3 and P@5 measure whether the correct tool appears among the top
-    few suggestions. For queries with a single correct tool (Tiers 1 &amp; 2), P@1 is the most
-    meaningful. For Tier 3 queries with multiple acceptable tools, P@3 and P@5 better reflect
-    whether the system surfaces the right options.
-  </dd>
-
+  <dd>Fraction of the top-k results that are correct.</dd>
   <dt>Hit@5</dt>
-  <dd>
-    Binary: did <em>any</em> correct tool appear in the top 5? This is the coarsest metric &mdash;
-    it answers &ldquo;would the agent have the right tool available at all?&rdquo; A Hit@5 of
-    1.0 means the system never completely misses.
-  </dd>
+  <dd>Binary: did any correct tool appear in the top 5?</dd>
 </dl>
+
+{_desc_block(descriptions, "methodology")}
 
 <!-- ============================================================ -->
 <h2>Results</h2>
 
 <h3>Learning Curves</h3>
-<p>
-  The charts below show how each metric evolves over {n_rounds} rounds. Solid lines are the
-  adaptive system; dashed lines are the semantic-only baseline. Upward separation between the
-  two demonstrates that historical feedback is improving tool selection. Look for the
-  characteristic shape: rapid improvement in early rounds as the system accumulates initial
-  feedback, then a plateau as returns diminish.
-</p>
+{_desc_block(descriptions, "learning_curves")}
 
 <div class="charts">
   <div class="chart-card"><div id="chart-mrr"></div>
-    <p class="caption">
-      MRR tracks how high the first correct tool ranks. Tier 1 starts near 1.0 (semantic search
-      nails direct matches). Tier 3 shows the steepest improvement as feedback disambiguates
-      vague queries. The dashed baseline stays flat &mdash; without feedback, semantic-only
-      performance does not improve.
-    </p>
+    {_desc_block(descriptions, "mrr_caption", "p class='caption'")}
   </div>
   <div class="chart-card"><div id="chart-p1"></div>
-    <p class="caption">
-      Precision@1 is the &ldquo;first try&rdquo; success rate. Gains here mean the system is
-      learning to put the right tool at rank #1 more often, reducing the need for the agent
-      to scan multiple options.
-    </p>
+    {_desc_block(descriptions, "p1_caption", "p class='caption'")}
   </div>
   <div class="chart-card"><div id="chart-hit"></div>
-    <p class="caption">
-      Hit@5 and broader precision metrics for the adaptive system. Hit@5 approaching 1.0 means
-      the system almost never fails to include the right tool. P@3 and P@5 rising indicate
-      better tools are displacing irrelevant ones in the top-k.
-    </p>
+    {_desc_block(descriptions, "hit_caption", "p class='caption'")}
   </div>
 </div>
 
 <h3>Milestone Metrics</h3>
-<p>
-  Key checkpoints from the learning curve. The highlighted &ldquo;Baseline&rdquo; row shows
-  the semantic-only system for comparison. Watch how each tier converges at different rates
-  &mdash; Tier 1 is already perfect, Tier 2 improves quickly, and Tier 3 shows the longest
-  learning tail.
-</p>
+{_desc_block(descriptions, "milestones")}
 <table>
 <thead><tr>
   <th>Round</th><th>MRR</th><th>P@1</th><th>P@3</th><th>P@5</th><th>Hit@5</th>
@@ -557,9 +621,7 @@ def generate_html_report(
 <div class="summary">
 <div>
 <h3>Round 1 &rarr; Round {r_last['round']} (Learning Over Time)</h3>
-<p style="font-size:0.8125rem;color:#6b7280">
-  How much the adaptive system improved from cold start to final round.
-</p>
+{_desc_block(descriptions, "improvement")}
 <table>
 <thead><tr><th>Metric</th><th>Round 1</th><th>Round {r_last['round']}</th><th>Change</th></tr></thead>
 <tbody>{"".join(imp_rows)}</tbody>
@@ -567,10 +629,6 @@ def generate_html_report(
 </div>
 <div>
 <h3>Baseline vs. Adaptive (Value of Feedback)</h3>
-<p style="font-size:0.8125rem;color:#6b7280">
-  Final semantic-only baseline against final adaptive performance.
-  Isolates the contribution of historical learning.
-</p>
 <table>
 <thead><tr><th>Metric</th><th>Baseline</th><th>Adaptive</th><th>Change</th></tr></thead>
 <tbody>{"".join(avb_rows)}</tbody>
@@ -578,30 +636,28 @@ def generate_html_report(
 </div>
 </div>
 
-<h3 style="margin-top:1.5rem">Tier 3 (Ambiguous) &mdash; Where Learning Matters Most</h3>
-<p>
-  Ambiguous queries are where semantic search alone is weakest and where historical feedback
-  should provide the biggest lift:
-</p>
+<h3 style="margin-top:1.5rem">Tier 3 (Ambiguous)</h3>
+{_desc_block(descriptions, "improvement_tier3")}
 <table style="max-width:500px">
 <thead><tr><th>Metric</th><th>Round 1</th><th>Round {r_last['round']}</th><th>Change</th></tr></thead>
 <tbody>{"".join(t3_imp_rows)}</tbody>
 </table>
 
-<div class="note">
-  <strong>Key takeaway:</strong> The adaptive system substantially outperforms the semantic-only
-  baseline on MRR and Precision, with the largest gains on Tier 3 (ambiguous) queries. Hit@5 may
-  decrease slightly because the holdout fusion replaces some semantic results with historically-proven
-  ones &mdash; the top-k is more focused but may miss a lower-ranked correct tool. This is the right
-  tradeoff: getting the #1 tool right matters more than having a correct tool somewhere in 5 options.
-  The results validate the core hypothesis &mdash; historical fitness feedback provides the most value
-  when tool descriptions don&rsquo;t clearly distinguish candidates, and the system needs to learn
-  from experience which tool the agent actually wants.
-</div>
+{_desc_note(descriptions, "improvement_takeaway")}
+
+{sig_html}
+
+{holdout_section}
+
+{baselines_section}
+
+{multi_turn_section}
 
 {sweep_section}
 
 {fitness_section}
+
+{compaction_section}
 
 <!-- ============================================================ -->
 <!-- D3 Charts -->
@@ -609,7 +665,8 @@ def generate_html_report(
 const DATA = {chart_json};
 const COLORS = {{
   overall: "#2563eb", t1: "#16a34a", t2: "#9333ea", t3: "#dc2626",
-  baseline: "#94a3b8", hit5: "#2563eb", p3: "#16a34a", p5: "#9333ea"
+  baseline: "#94a3b8", hit5: "#2563eb", p3: "#16a34a", p5: "#9333ea",
+  train: "#f59e0b", test: "#ef4444"
 }};
 
 const tooltip = d3.select("#tooltip");
@@ -643,7 +700,7 @@ function lineChart(container, config) {{
   g.append("g").attr("class", "grid")
     .call(d3.axisLeft(y).ticks(5).tickSize(-w).tickFormat(""));
 
-  // Axes — smart tick count for large round counts
+  // Axes
   const xTicks = nRounds <= 15 ? nRounds : Math.min(10, nRounds);
   g.append("g").attr("class", "axis").attr("transform", `translate(0,${{h}})`)
     .call(d3.axisBottom(x).ticks(xTicks).tickFormat(d => d));
@@ -656,12 +713,19 @@ function lineChart(container, config) {{
 
   const line = d3.line().x((d, i) => x(i + 1)).y(d => y(d));
 
-  // Decide whether to show individual dots (cluttered above ~20 rounds)
   const showDots = nRounds <= 25;
 
   series.forEach(s => {{
-    // Confidence band
-    if (s.stds && s.stds.some(v => v > 0)) {{
+    // CI band (preferred) or stddev band
+    const hasCIs = s.cis && s.cis.some(v => v !== null);
+    if (hasCIs) {{
+      const area = d3.area()
+        .x((d, i) => x(i + 1))
+        .y0((d, i) => y(s.cis[i] ? s.cis[i][0] : s.values[i]))
+        .y1((d, i) => y(s.cis[i] ? s.cis[i][1] : s.values[i]));
+      g.append("path").datum(s.values)
+        .attr("d", area).attr("fill", s.color).attr("opacity", 0.12);
+    }} else if (s.stds && s.stds.some(v => v > 0)) {{
       const area = d3.area()
         .x((d, i) => x(i + 1))
         .y0((d, i) => y(s.values[i] - s.stds[i]))
@@ -676,7 +740,7 @@ function lineChart(container, config) {{
       .attr("stroke-dasharray", s.dashed ? "6,3" : "none")
       .attr("d", line);
 
-    // Dots (individual or milestone-only)
+    // Dots
     const indices = showDots
       ? s.values.map((_, i) => i)
       : [0, 4, 9, 24, 49, 99].filter(i => i < s.values.length);
@@ -689,6 +753,7 @@ function lineChart(container, config) {{
       .on("mouseover", function(event, i) {{
         let text = `${{s.label}} R${{i + 1}}: ${{s.values[i].toFixed(3)}}`;
         if (s.stds && s.stds[i] > 0) text += ` (\u00b1${{s.stds[i].toFixed(3)}})`;
+        if (s.cis && s.cis[i]) text += ` [${{s.cis[i][0].toFixed(3)}}, ${{s.cis[i][1].toFixed(3)}}]`;
         tooltip.style("opacity", 1).html(text);
       }})
       .on("mousemove", function(event) {{
@@ -714,17 +779,23 @@ lineChart("#chart-mrr", {{
   title: "MRR by Round (Adaptive vs. Baseline)",
   series: [
     {{ label: "Overall", color: COLORS.overall,
-       values: DATA.adaptive.overall_mrr.values, stds: DATA.adaptive.overall_mrr.stds }},
+       values: DATA.adaptive.overall_mrr.values, stds: DATA.adaptive.overall_mrr.stds,
+       cis: DATA.adaptive.overall_mrr.cis }},
     {{ label: "Tier 1 (Direct)", color: COLORS.t1,
-       values: DATA.adaptive.t1_mrr.values, stds: DATA.adaptive.t1_mrr.stds }},
+       values: DATA.adaptive.t1_mrr.values, stds: DATA.adaptive.t1_mrr.stds,
+       cis: DATA.adaptive.t1_mrr.cis }},
     {{ label: "Tier 2 (Indirect)", color: COLORS.t2,
-       values: DATA.adaptive.t2_mrr.values, stds: DATA.adaptive.t2_mrr.stds }},
+       values: DATA.adaptive.t2_mrr.values, stds: DATA.adaptive.t2_mrr.stds,
+       cis: DATA.adaptive.t2_mrr.cis }},
     {{ label: "Tier 3 (Ambiguous)", color: COLORS.t3,
-       values: DATA.adaptive.t3_mrr.values, stds: DATA.adaptive.t3_mrr.stds }},
+       values: DATA.adaptive.t3_mrr.values, stds: DATA.adaptive.t3_mrr.stds,
+       cis: DATA.adaptive.t3_mrr.cis }},
     {{ label: "Baseline (Overall)", color: COLORS.baseline, dashed: true,
-       values: DATA.baseline.overall_mrr.values, stds: DATA.baseline.overall_mrr.stds }},
+       values: DATA.baseline.overall_mrr.values, stds: DATA.baseline.overall_mrr.stds,
+       cis: DATA.baseline.overall_mrr.cis }},
     {{ label: "Baseline (Tier 3)", color: COLORS.baseline, dashed: true,
-       values: DATA.baseline.t3_mrr.values, stds: DATA.baseline.t3_mrr.stds }},
+       values: DATA.baseline.t3_mrr.values, stds: DATA.baseline.t3_mrr.stds,
+       cis: DATA.baseline.t3_mrr.cis }},
   ]
 }});
 
@@ -733,15 +804,20 @@ lineChart("#chart-p1", {{
   title: "Precision@1 by Round",
   series: [
     {{ label: "Overall", color: COLORS.overall,
-       values: DATA.adaptive.overall_p1.values, stds: DATA.adaptive.overall_p1.stds }},
+       values: DATA.adaptive.overall_p1.values, stds: DATA.adaptive.overall_p1.stds,
+       cis: DATA.adaptive.overall_p1.cis }},
     {{ label: "Tier 1", color: COLORS.t1,
-       values: DATA.adaptive.t1_p1.values, stds: DATA.adaptive.t1_p1.stds }},
+       values: DATA.adaptive.t1_p1.values, stds: DATA.adaptive.t1_p1.stds,
+       cis: DATA.adaptive.t1_p1.cis }},
     {{ label: "Tier 2", color: COLORS.t2,
-       values: DATA.adaptive.t2_p1.values, stds: DATA.adaptive.t2_p1.stds }},
+       values: DATA.adaptive.t2_p1.values, stds: DATA.adaptive.t2_p1.stds,
+       cis: DATA.adaptive.t2_p1.cis }},
     {{ label: "Tier 3", color: COLORS.t3,
-       values: DATA.adaptive.t3_p1.values, stds: DATA.adaptive.t3_p1.stds }},
+       values: DATA.adaptive.t3_p1.values, stds: DATA.adaptive.t3_p1.stds,
+       cis: DATA.adaptive.t3_p1.cis }},
     {{ label: "Baseline (Overall)", color: COLORS.baseline, dashed: true,
-       values: DATA.baseline.overall_p1.values, stds: DATA.baseline.overall_p1.stds }},
+       values: DATA.baseline.overall_p1.values, stds: DATA.baseline.overall_p1.stds,
+       cis: DATA.baseline.overall_p1.cis }},
   ]
 }});
 
@@ -750,13 +826,92 @@ lineChart("#chart-hit", {{
   title: "Overall Hit Rate & Precision",
   series: [
     {{ label: "Hit@5", color: COLORS.hit5,
-       values: DATA.adaptive.overall_hit5.values, stds: DATA.adaptive.overall_hit5.stds }},
+       values: DATA.adaptive.overall_hit5.values, stds: DATA.adaptive.overall_hit5.stds,
+       cis: DATA.adaptive.overall_hit5.cis }},
     {{ label: "P@3", color: COLORS.p3,
-       values: DATA.adaptive.overall_p3.values, stds: DATA.adaptive.overall_p3.stds }},
+       values: DATA.adaptive.overall_p3.values, stds: DATA.adaptive.overall_p3.stds,
+       cis: DATA.adaptive.overall_p3.cis }},
     {{ label: "P@5", color: COLORS.p5,
-       values: DATA.adaptive.overall_p5.values, stds: DATA.adaptive.overall_p5.stds }},
+       values: DATA.adaptive.overall_p5.values, stds: DATA.adaptive.overall_p5.stds,
+       cis: DATA.adaptive.overall_p5.cis }},
   ]
 }});
+
+// ============================================================
+// Holdout charts
+if (DATA.adaptive_test) {{
+  lineChart("#chart-holdout-mrr", {{
+    title: "Train vs. Test MRR",
+    series: [
+      {{ label: "Train MRR", color: COLORS.train,
+         values: DATA.adaptive_train.overall_mrr.values, stds: DATA.adaptive_train.overall_mrr.stds,
+         cis: DATA.adaptive_train.overall_mrr.cis }},
+      {{ label: "Test MRR", color: COLORS.test,
+         values: DATA.adaptive_test.overall_mrr.values, stds: DATA.adaptive_test.overall_mrr.stds,
+         cis: DATA.adaptive_test.overall_mrr.cis }},
+      {{ label: "Baseline", color: COLORS.baseline, dashed: true,
+         values: DATA.baseline.overall_mrr.values, stds: DATA.baseline.overall_mrr.stds,
+         cis: DATA.baseline.overall_mrr.cis }},
+    ]
+  }});
+  lineChart("#chart-holdout-p1", {{
+    title: "Train vs. Test P@1",
+    series: [
+      {{ label: "Train P@1", color: COLORS.train,
+         values: DATA.adaptive_train.overall_p1.values, stds: DATA.adaptive_train.overall_p1.stds,
+         cis: DATA.adaptive_train.overall_p1.cis }},
+      {{ label: "Test P@1", color: COLORS.test,
+         values: DATA.adaptive_test.overall_p1.values, stds: DATA.adaptive_test.overall_p1.stds,
+         cis: DATA.adaptive_test.overall_p1.cis }},
+      {{ label: "Baseline", color: COLORS.baseline, dashed: true,
+         values: DATA.baseline.overall_p1.values, stds: DATA.baseline.overall_p1.stds,
+         cis: DATA.baseline.overall_p1.cis }},
+    ]
+  }});
+}}
+
+// ============================================================
+// Baseline comparison charts
+if (DATA.baselines) {{
+  const allBaselines = DATA.baselines.slice();
+  // Add adaptive final round
+  const lastRound = DATA.rounds.length - 1;
+  allBaselines.push({{
+    label: "Adaptive (final)",
+    overall_mrr: DATA.adaptive.overall_mrr.values[lastRound],
+    overall_p1: DATA.adaptive.overall_p1.values[lastRound],
+    overall_hit5: DATA.adaptive.overall_hit5.values[lastRound],
+    t1_mrr: DATA.adaptive.t1_mrr.values[lastRound],
+    t2_mrr: DATA.adaptive.t2_mrr.values[lastRound],
+    t3_mrr: DATA.adaptive.t3_mrr.values[lastRound],
+  }});
+
+  const blMrrGroups = allBaselines.map(b => ({{
+    label: b.label,
+    bars: [
+      {{ label: "Overall", value: b.overall_mrr, color: COLORS.overall }},
+      {{ label: "Tier 1", value: b.t1_mrr, color: COLORS.t1 }},
+      {{ label: "Tier 2", value: b.t2_mrr, color: COLORS.t2 }},
+      {{ label: "Tier 3", value: b.t3_mrr, color: COLORS.t3 }},
+    ]
+  }}));
+  groupedBarChart("#chart-baselines-mrr", {{
+    title: "MRR by Baseline Method",
+    groups: blMrrGroups,
+  }});
+
+  const blP1Groups = allBaselines.map(b => ({{
+    label: b.label,
+    bars: [
+      {{ label: "Overall P@1", value: b.overall_p1, color: COLORS.overall }},
+      {{ label: "Hit@5", value: b.overall_hit5, color: COLORS.hit5 }},
+    ]
+  }}));
+  groupedBarChart("#chart-baselines-p1", {{
+    title: "P@1 & Hit@5 by Baseline Method",
+    groups: blP1Groups,
+  }});
+}}
 
 // ============================================================
 // Shared grouped bar chart function
@@ -890,6 +1045,36 @@ if (DATA.fitness) {{
   groupedBarChart("#chart-fitness-p1", {{
     title: "Final Precision@1 by Fitness Preset",
     groups: fitP1Groups,
+  }});
+}}
+
+// ============================================================
+// Compaction sweep charts
+if (DATA.compaction) {{
+  const compGroups = DATA.compaction.map(c => ({{
+    label: c.label,
+    bars: [
+      {{ label: "Overall", value: c.overall_mrr, color: COLORS.overall }},
+      {{ label: "Tier 1", value: c.t1_mrr, color: COLORS.t1 }},
+      {{ label: "Tier 2", value: c.t2_mrr, color: COLORS.t2 }},
+      {{ label: "Tier 3", value: c.t3_mrr, color: COLORS.t3 }},
+    ]
+  }}));
+  groupedBarChart("#chart-compaction-mrr", {{
+    title: "Final MRR by Compaction Frequency",
+    groups: compGroups,
+  }});
+
+  const compP1Groups = DATA.compaction.map(c => ({{
+    label: c.label,
+    bars: [
+      {{ label: "Overall P@1", value: c.overall_p1, color: COLORS.overall }},
+      {{ label: "Tier 3 P@1", value: c.t3_p1, color: COLORS.t3 }},
+    ]
+  }}));
+  groupedBarChart("#chart-compaction-p1", {{
+    title: "Final P@1 by Compaction Frequency",
+    groups: compP1Groups,
   }});
 }}
 </script>

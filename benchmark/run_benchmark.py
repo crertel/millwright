@@ -1,12 +1,16 @@
 """Entry point: python -m benchmark.run_benchmark"""
 
 import argparse
+import json
 import time
 from pathlib import Path
 
 from .queries import get_queries
 from .report import generate_html_report
-from .simulation import run_simulation, run_slot_sweep, run_fitness_sweep
+from .simulation import (
+    run_simulation, run_slot_sweep, run_fitness_sweep,
+    run_baselines, run_compaction_sweep,
+)
 from .tools import get_tools
 
 MILESTONES = [1, 5, 10, 25, 50, 100]
@@ -66,30 +70,76 @@ def format_table(results: list[dict], label: str = "", milestones: list[int] | N
     return "\n".join(lines)
 
 
+def _serialize_results(
+    sim_data, sweep_data, fitness_data, baselines_data,
+    compaction_data, elapsed,
+) -> dict:
+    """Build a JSON-serializable dict of all benchmark results."""
+    out = {
+        "simulation": sim_data,
+        "elapsed": elapsed,
+    }
+    if sweep_data is not None:
+        out["slot_sweep"] = sweep_data
+    if fitness_data is not None:
+        out["fitness_sweep"] = fitness_data
+    if baselines_data is not None:
+        out["baselines"] = baselines_data
+    if compaction_data is not None:
+        out["compaction_sweep"] = compaction_data
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description="Millwright benchmark")
     parser.add_argument("--rounds", type=int, default=100, help="Number of rounds (default: 100)")
     parser.add_argument("--seeds", type=int, default=1, help="Number of random seeds")
     parser.add_argument("--noise", type=float, default=0.0, help="Feedback noise (0.0-1.0)")
+    parser.add_argument("--noise-model", choices=["uniform", "correlated"], default="uniform",
+                        help="Noise model (default: uniform)")
     parser.add_argument("--seed", type=int, default=42, help="Base random seed")
     parser.add_argument("--sweep-rounds", type=int, default=10,
                         help="Rounds per config in sweeps (default: 10)")
     parser.add_argument("--no-sweep", action="store_true", help="Skip slot sweep")
     parser.add_argument("--no-fitness-sweep", action="store_true", help="Skip fitness sweep")
+    parser.add_argument("--no-baselines", action="store_true", help="Skip baseline comparison")
+    parser.add_argument("--no-compaction-sweep", action="store_true", help="Skip compaction sweep")
+    parser.add_argument("--holdout", type=float, default=0.0,
+                        help="Holdout fraction for train/test split (default: 0, disabled)")
+    parser.add_argument("--continuation-prob", type=float, default=0.0,
+                        help="Probability of multi-turn continuation (default: 0)")
+    parser.add_argument("--results-json", type=str, default=None,
+                        help="Save structured results to JSON file")
+    parser.add_argument("--descriptions", type=str, default=None,
+                        help="Load description blocks from JSON file")
     parser.add_argument("-o", "--output", type=str, default="benchmark_report.html")
     args = parser.parse_args()
 
-    n_phases = 1 + (0 if args.no_sweep else 1) + (0 if args.no_fitness_sweep else 1)
+    n_phases = (
+        1
+        + (0 if args.no_sweep else 1)
+        + (0 if args.no_fitness_sweep else 1)
+        + (0 if args.no_baselines else 1)
+        + (0 if args.no_compaction_sweep else 1)
+    )
     phase = 0
 
     print("Millwright Benchmark")
     print(f"  Learning curve: {args.rounds} rounds, {args.seeds} seed(s)")
+    if args.holdout > 0:
+        print(f"  Holdout: {args.holdout:.0%} test split")
+    if args.continuation_prob > 0:
+        print(f"  Multi-turn: {args.continuation_prob:.0%} continuation probability")
     if not args.no_sweep:
         print(f"  Slot sweep: 9 configs x {args.sweep_rounds} rounds")
     if not args.no_fitness_sweep:
         print(f"  Fitness sweep: 8 presets x {args.sweep_rounds} rounds")
+    if not args.no_baselines:
+        print(f"  Baselines: random, TF-IDF, semantic")
+    if not args.no_compaction_sweep:
+        print(f"  Compaction sweep: 5 frequencies x {args.sweep_rounds} rounds")
     if args.noise > 0:
-        print(f"  Feedback noise: {args.noise:.0%}")
+        print(f"  Feedback noise: {args.noise:.0%} ({args.noise_model})")
     print()
 
     # Phase 1: Learning curve
@@ -101,6 +151,9 @@ def main():
         seed=args.seed,
         n_seeds=args.seeds,
         feedback_noise=args.noise,
+        noise_model=args.noise_model,
+        holdout_fraction=args.holdout,
+        continuation_prob=args.continuation_prob,
     )
     t_sim = time.time() - t0
     print(f"  Done in {t_sim:.1f}s")
@@ -108,7 +161,30 @@ def main():
     milestones = [m for m in MILESTONES if m <= args.rounds]
     print(format_table(sim_data["adaptive"], "Adaptive", milestones=milestones))
 
-    # Phase 2: Slot holdout sweep
+    # Phase: Baselines
+    baselines_data = None
+    t_baselines = 0.0
+    if not args.no_baselines:
+        phase += 1
+        print(f"Phase {phase}/{n_phases}: Baselines...", flush=True)
+        t0 = time.time()
+        baselines_data = run_baselines(
+            seed=args.seed,
+            n_seeds=args.seeds,
+        )
+        t_baselines = time.time() - t0
+        print(f"  Done in {t_baselines:.1f}s")
+
+        print("\nBaseline Comparison:")
+        print("-" * 60)
+        for entry in baselines_data:
+            o = entry["metrics"]["overall"]
+            t3 = entry["metrics"].get("tier_3", {})
+            print(f"  {entry['label']:<12} MRR={o['mrr']:.3f}  P@1={o['p@1']:.3f}  "
+                  f"Hit@5={o['hit@5']:.3f}  T3 MRR={t3.get('mrr', 0):.3f}")
+        print()
+
+    # Phase: Slot holdout sweep
     sweep_data = None
     t_sweep = 0.0
     if not args.no_sweep:
@@ -119,6 +195,7 @@ def main():
             n_rounds=args.sweep_rounds,
             seed=args.seed,
             feedback_noise=args.noise,
+            noise_model=args.noise_model,
         )
         t_sweep = time.time() - t0
         print(f"  Done in {t_sweep:.1f}s")
@@ -131,7 +208,7 @@ def main():
             print(f"  {entry['label']:>7}  MRR={final['mrr']:.3f}  T3 MRR={t3['mrr']:.3f}")
         print()
 
-    # Phase 3: Fitness sweep
+    # Phase: Fitness sweep
     fitness_data = None
     t_fitness = 0.0
     if not args.no_fitness_sweep:
@@ -142,6 +219,7 @@ def main():
             n_rounds=args.sweep_rounds,
             seed=args.seed,
             feedback_noise=args.noise,
+            noise_model=args.noise_model,
         )
         t_fitness = time.time() - t0
         print(f"  Done in {t_fitness:.1f}s")
@@ -156,8 +234,50 @@ def main():
             print(f"  {entry['label']:<20} {vals}  MRR={final['mrr']:.3f}  T3={t3['mrr']:.3f}")
         print()
 
-    elapsed = t_sim + t_sweep + t_fitness
+    # Phase: Compaction sweep
+    compaction_data = None
+    t_compaction = 0.0
+    if not args.no_compaction_sweep:
+        phase += 1
+        print(f"Phase {phase}/{n_phases}: Compaction sweep...", flush=True)
+        t0 = time.time()
+        compaction_data = run_compaction_sweep(
+            n_rounds=args.sweep_rounds,
+            seed=args.seed,
+            feedback_noise=args.noise,
+            noise_model=args.noise_model,
+        )
+        t_compaction = time.time() - t0
+        print(f"  Done in {t_compaction:.1f}s")
+
+        print("\nCompaction Sweep (final-round MRR):")
+        print("-" * 50)
+        for entry in compaction_data:
+            final = entry["rounds"][-1]["overall"]
+            t3 = entry["rounds"][-1]["tier_3"]
+            print(f"  {entry['label']:<15}  MRR={final['mrr']:.3f}  T3 MRR={t3['mrr']:.3f}")
+        print()
+
+    elapsed = t_sim + t_baselines + t_sweep + t_fitness + t_compaction
     print(f"Total: {elapsed:.1f}s")
+
+    # Save structured results JSON
+    if args.results_json:
+        json_path = Path(args.results_json)
+        json_path.write_text(json.dumps(
+            _serialize_results(
+                sim_data, sweep_data, fitness_data,
+                baselines_data, compaction_data, elapsed,
+            ),
+            indent=2, default=str,
+        ))
+        print(f"Results JSON written to {json_path}")
+
+    # Load descriptions
+    desc = None
+    if args.descriptions:
+        desc_path = Path(args.descriptions)
+        desc = json.loads(desc_path.read_text())
 
     tools = get_tools()
     queries = get_queries()
@@ -171,6 +291,9 @@ def main():
         sim_data, sweep_data, fitness_data, elapsed,
         n_tools=n_tools, n_queries=n_queries,
         n_categories=n_categories, tier_counts=tier_counts,
+        descriptions=desc,
+        baselines=baselines_data,
+        compaction_sweep=compaction_data,
     ))
     print(f"HTML report written to {report_path}")
 
