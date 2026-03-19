@@ -118,6 +118,8 @@ Results from a 100-round, 3-seed run with 20% holdout and multi-turn testing:
 - Fitness multipliers: "Mild" and "Wide" tied at MRR=0.908; "Flat" (no learning signal) drops to 0.660
 - Compaction frequency: every 1–2 rounds optimal; every 10+ rounds degrades to no-learning baseline
 
+**Train/test holdout (20% held out, no feedback):** Train MRR reaches 0.943 while test MRR settles at 0.626 — a large gap. This is expected: the toolshed is designed to memorize which tools work for queries the agent actually asks. The improvement is concentrated on seen queries, which is the intended use case. Test set performance stays well above Random (0.018) and TF-IDF (0.617), showing some generalization through embedding similarity in the review index.
+
 Open `benchmark_report.html` for full interactive charts including holdout evaluation, baseline comparison, multi-turn results, and all sweep visualizations.
 
 ## Algorithm deep dives
