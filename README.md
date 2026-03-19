@@ -82,6 +82,113 @@ python -m benchmark.run_benchmark -o my_report.html
 
 The benchmark produces a `benchmark_report.html` with interactive D3 charts. Without `--descriptions`, the report renders charts and tables only (no interpretive text). Pass a JSON file mapping section keys to prose to populate narrative blocks.
 
+### CLI reference
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--rounds N` | 100 | Learning curve rounds |
+| `--seeds N` | 1 | Random seeds for averaging (≥3 enables CIs and significance tests) |
+| `--seed N` | 42 | Base random seed |
+| `--holdout F` | 0.0 | Fraction of queries held out for test-only evaluation (stratified by tier) |
+| `--continuation-prob F` | 0.0 | Probability of multi-turn continuation when P@1 misses |
+| `--noise F` | 0.0 | Feedback noise probability (0.0–1.0) |
+| `--noise-model` | uniform | `uniform` or `correlated` (category confusion pairs) |
+| `--sweep-rounds N` | 10 | Rounds per configuration in sweeps |
+| `--no-sweep` | | Skip slot holdout sweep |
+| `--no-fitness-sweep` | | Skip fitness multiplier sweep |
+| `--no-baselines` | | Skip baseline comparison (random, TF-IDF, semantic) |
+| `--no-compaction-sweep` | | Skip compaction frequency sweep |
+| `--results-json PATH` | | Save structured results to JSON |
+| `--descriptions PATH` | | Load narrative description blocks from JSON |
+| `-o PATH` | benchmark_report.html | Output HTML report path |
+
+### Working with results
+
+`--results-json` writes a JSON file with all benchmark data for external analysis:
+
+```sh
+python -m benchmark.run_benchmark --rounds 50 --seeds 3 --holdout 0.2 --results-json results.json
+```
+
+The JSON structure:
+
+```
+{
+  "simulation": {
+    "adaptive": [                    # per-round metrics
+      {
+        "round": 1,
+        "overall": {"mrr": ..., "p@1": ..., "p@3": ..., "p@5": ..., "hit@5": ...},
+        "tier_1": {...}, "tier_2": {...}, "tier_3": {...},
+        "overall_std": {...},        # stddev across seeds (when seeds > 1)
+        "overall_ci": {"mrr": [lo, hi], ...},  # bootstrap 95% CI (when seeds >= 3)
+        "train_overall": {...},      # training set only (when --holdout > 0)
+        "test_overall": {...},       # holdout set only
+        "test_tier_1": {...}, ...
+      },
+      ...
+    ],
+    "baseline": [...],               # same shape, semantic-only (no feedback)
+    "n_seeds": 3,
+    "feedback_noise": 0.0,
+    "significance": {                # when seeds >= 3
+      "wilcoxon": {"mrr": {"statistic": ..., "p_value": ...}, ...},
+      "adaptive_final_ci": {"mrr": [lo, hi], ...}
+    }
+  },
+  "baselines": [                     # when baselines enabled
+    {"label": "Random",   "metrics": {"overall": {...}, "tier_1": {...}, ...}},
+    {"label": "TF-IDF",   "metrics": {...}},
+    {"label": "Semantic", "metrics": {...}}
+  ],
+  "slot_sweep": [                    # when sweep enabled
+    {"label": "S5/H0", "min_semantic_slots": 5, "min_historical_slots": 0,
+     "rounds": [...]},
+    ...
+  ],
+  "fitness_sweep": [                 # when fitness sweep enabled
+    {"label": "Mild", "preset": {"perfect": 1.2, ...}, "rounds": [...]},
+    ...
+  ],
+  "compaction_sweep": [              # when compaction sweep enabled
+    {"label": "Every round", "compact_every": 1, "rounds": [...]},
+    ...
+  ],
+  "elapsed": 18405.3
+}
+```
+
+Example: extract the learning curve into a CSV for plotting elsewhere:
+
+```python
+import json, csv
+
+with open("results.json") as f:
+    data = json.load(f)
+
+with open("learning_curve.csv", "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["round", "mrr", "p@1", "hit@5", "t3_mrr"])
+    for r in data["simulation"]["adaptive"]:
+        w.writerow([r["round"], r["overall"]["mrr"], r["overall"]["p@1"],
+                    r["overall"]["hit@5"], r["tier_3"]["mrr"]])
+```
+
+### Report descriptions
+
+The `--descriptions` flag accepts a JSON file mapping section keys to HTML strings. Any key not present renders as empty (charts and tables still appear). Section keys:
+
+`intro`, `methodology`, `learning_curves`, `mrr_caption`, `p1_caption`, `hit_caption`, `milestones`, `improvement`, `improvement_tier3`, `improvement_takeaway`, `slot_sweep`, `slot_sweep_interpretation`, `slot_sweep_mrr_caption`, `slot_sweep_p1_caption`, `fitness_sweep`, `fitness_sweep_interpretation`, `fitness_sweep_mrr_caption`, `fitness_sweep_p1_caption`, `holdout_eval`, `baselines`, `multi_turn`, `compaction_sweep`, `compaction_sweep_interpretation`
+
+Example:
+
+```json
+{
+  "intro": "Millwright is an adaptive tool selection system for AI agents.",
+  "improvement_takeaway": "<strong>Key finding:</strong> Tier 3 gains are largest."
+}
+```
+
 ## Benchmark results
 
 200 tools across 12 domains, 120 queries in 3 tiers:
