@@ -202,23 +202,31 @@ def run_simulation(
     }
 
 
-def run_weight_sweep(
-    weights: list[tuple[float, float]] | None = None,
+def run_slot_sweep(
+    configs: list[tuple[int, int]] | None = None,
     n_rounds: int = 10,
     seed: int = 42,
     config: MillwrightConfig | None = None,
     feedback_noise: float = 0.0,
 ) -> list[dict]:
-    """Sweep semantic/historical weight ratios.
+    """Sweep min_semantic_slots / min_historical_slots holdout ratios.
 
-    Returns a list of dicts, one per weight config:
-      {"semantic_weight", "historical_weight", "label", "rounds": [...]}
-    Each round entry has the same structure as run_simulation adaptive results.
+    Each config is (min_semantic_slots, min_historical_slots).
+
+    Returns a list of dicts, one per slot config:
+      {"min_semantic_slots", "min_historical_slots", "label", "rounds": [...]}
     """
-    if weights is None:
-        weights = [
-            (1.0, 0.0), (0.9, 0.1), (0.8, 0.2), (0.7, 0.3),
-            (0.6, 0.4), (0.5, 0.5), (0.4, 0.6), (0.3, 0.7), (0.2, 0.8),
+    if configs is None:
+        configs = [
+            (5, 0),  # semantic only (no historical holdout)
+            (4, 1),  # mostly semantic
+            (3, 2),  # balanced-ish
+            (3, 1),  # 3 semantic + 1 historical + 1 interleave
+            (2, 2),  # equal holdout
+            (2, 1),  # default
+            (1, 3),  # mostly historical
+            (1, 2),  # historical-heavy
+            (0, 4),  # almost pure historical
         ]
 
     base_config = config or MillwrightConfig()
@@ -228,16 +236,20 @@ def run_weight_sweep(
     embedder = Embedder(base_config)
 
     results = []
-    for sw, hw in weights:
-        cfg = _clone_config(base_config, semantic_weight=sw, historical_weight=hw)
+    for sem_slots, hist_slots in configs:
+        cfg = _clone_config(
+            base_config,
+            min_semantic_slots=sem_slots,
+            min_historical_slots=hist_slots,
+        )
         rounds = _run_single(
             n_rounds, seed, cfg, embedder, queries, tool_categories,
             baseline=False, feedback_noise=feedback_noise,
         )
         results.append({
-            "semantic_weight": sw,
-            "historical_weight": hw,
-            "label": f"{sw:.1f}/{hw:.1f}",
+            "min_semantic_slots": sem_slots,
+            "min_historical_slots": hist_slots,
+            "label": f"S{sem_slots}/H{hist_slots}",
             "rounds": rounds,
         })
 

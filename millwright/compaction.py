@@ -14,7 +14,8 @@ def compact_reviews(
     config: MillwrightConfig,
 ) -> list[ReviewIndexEntry]:
     """Group reviews by tool, K-means cluster their query embeddings,
-    output one index entry per centroid with weighted average fitness."""
+    output one index entry per centroid with fitness weighted by
+    similarity to centroid."""
     # Group by tool
     by_tool: dict[str, list[ReviewEntry]] = defaultdict(list)
     for r in reviews:
@@ -56,12 +57,21 @@ def compact_reviews(
 
             centroid = cluster_embeddings.mean(axis=0)
             centroid = centroid / (np.linalg.norm(centroid) + 1e-10)
-            avg_fitness = float(cluster_fitnesses.mean())
+
+            # Weight each review's fitness by its cosine similarity to the
+            # cluster centroid, so reviews near the center count more.
+            similarities = cluster_embeddings @ centroid
+            similarities = np.clip(similarities, 0.0, None)
+            sim_sum = similarities.sum()
+            if sim_sum > 0:
+                weighted_fitness = float((cluster_fitnesses * similarities).sum() / sim_sum)
+            else:
+                weighted_fitness = float(cluster_fitnesses.mean())
 
             index_entries.append(ReviewIndexEntry(
                 tool_name=tool_name,
                 query_centroid=centroid.astype(np.float32),
-                aggregate_fitness=avg_fitness,
+                aggregate_fitness=weighted_fitness,
                 count=count,
             ))
 

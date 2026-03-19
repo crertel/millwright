@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .queries import get_queries
 from .report import generate_html_report
-from .simulation import run_simulation, run_weight_sweep, run_fitness_sweep
+from .simulation import run_simulation, run_slot_sweep, run_fitness_sweep
 from .tools import get_tools
 
 MILESTONES = [1, 5, 10, 25, 50, 100]
@@ -74,7 +74,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Base random seed")
     parser.add_argument("--sweep-rounds", type=int, default=10,
                         help="Rounds per config in sweeps (default: 10)")
-    parser.add_argument("--no-sweep", action="store_true", help="Skip weight sweep")
+    parser.add_argument("--no-sweep", action="store_true", help="Skip slot sweep")
     parser.add_argument("--no-fitness-sweep", action="store_true", help="Skip fitness sweep")
     parser.add_argument("-o", "--output", type=str, default="benchmark_report.html")
     args = parser.parse_args()
@@ -85,7 +85,7 @@ def main():
     print("Millwright Benchmark")
     print(f"  Learning curve: {args.rounds} rounds, {args.seeds} seed(s)")
     if not args.no_sweep:
-        print(f"  Weight sweep: 9 configs x {args.sweep_rounds} rounds")
+        print(f"  Slot sweep: 9 configs x {args.sweep_rounds} rounds")
     if not args.no_fitness_sweep:
         print(f"  Fitness sweep: 8 presets x {args.sweep_rounds} rounds")
     if args.noise > 0:
@@ -108,14 +108,14 @@ def main():
     milestones = [m for m in MILESTONES if m <= args.rounds]
     print(format_table(sim_data["adaptive"], "Adaptive", milestones=milestones))
 
-    # Phase 2: Weight sweep
+    # Phase 2: Slot holdout sweep
     sweep_data = None
     t_sweep = 0.0
     if not args.no_sweep:
         phase += 1
-        print(f"Phase {phase}/{n_phases}: Weight sweep...", flush=True)
+        print(f"Phase {phase}/{n_phases}: Slot sweep...", flush=True)
         t0 = time.time()
-        sweep_data = run_weight_sweep(
+        sweep_data = run_slot_sweep(
             n_rounds=args.sweep_rounds,
             seed=args.seed,
             feedback_noise=args.noise,
@@ -123,7 +123,7 @@ def main():
         t_sweep = time.time() - t0
         print(f"  Done in {t_sweep:.1f}s")
 
-        print("\nWeight Sweep (final-round MRR):")
+        print("\nSlot Sweep (final-round MRR):")
         print("-" * 50)
         for entry in sweep_data:
             final = entry["rounds"][-1]["overall"]

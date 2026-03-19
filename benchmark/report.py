@@ -61,8 +61,8 @@ def _build_chart_data(results: dict, sweep: list[dict] | None, fitness: list[dic
             final = entry["rounds"][-1]
             chart_data["sweep"].append({
                 "label": entry["label"],
-                "sw": entry["semantic_weight"],
-                "hw": entry["historical_weight"],
+                "sem_slots": entry.get("min_semantic_slots", 0),
+                "hist_slots": entry.get("min_historical_slots", 0),
                 "overall_mrr": final["overall"]["mrr"],
                 "t1_mrr": final["tier_1"]["mrr"],
                 "t2_mrr": final["tier_2"]["mrr"],
@@ -179,7 +179,7 @@ def generate_html_report(
         sweep_table = f"""
 <table>
 <thead><tr>
-  <th>Sem / Hist</th><th>MRR</th><th>P@1</th><th>P@3</th><th>Hit@5</th>
+  <th>Slots (S/H)</th><th>MRR</th><th>P@1</th><th>P@3</th><th>Hit@5</th>
   <th>T3 MRR</th><th>T3 P@1</th>
 </tr></thead>
 <tbody>{"".join(sweep_rows)}</tbody>
@@ -195,44 +195,43 @@ def generate_html_report(
         sweep_rounds = len(sweep[0]["rounds"])
         sweep_section = f"""
 <!-- ============================================================ -->
-<h2>Weight Sweep</h2>
+<h2>Slot Holdout Sweep</h2>
 <p>
-  How should Millwright balance semantic similarity against historical fitness? This sweep tests
-  9 weight ratios from pure semantic (1.0/0.0) to heavily historical (0.2/0.8), each run for
-  {sweep_rounds} rounds. The goal is to find the blend that maximizes final-round performance.
+  Millwright fuses rankings by interleaving semantic and historical results with a minimum holdout
+  from each signal. This sweep tests 9 slot configurations from pure semantic (S5/H0) to heavily
+  historical (S0/H4), each run for {sweep_rounds} rounds. The holdout guarantees that at least N
+  slots in the top-k come from each ranking signal, preventing one signal from dominating entirely.
 </p>
 
 <div class="charts">
   <div class="chart-card"><div id="chart-sweep-mrr"></div>
     <p class="caption">
-      Final-round MRR at each weight ratio, broken out by tier. The peak shows the optimal
-      balance point. Too little historical weight (left) misses learning signal; too much
-      (right) under-weights the semantic prior, hurting cold-start and direct-match queries.
+      Final-round MRR at each holdout configuration, broken out by tier. More historical slots
+      help ambiguous queries (T3) but too many hurt direct matches where semantic search excels.
     </p>
   </div>
   <div class="chart-card"><div id="chart-sweep-p1"></div>
     <p class="caption">
       Final-round Precision@1 overall and for Tier 3 (ambiguous). P@1 is more sensitive to
-      weight changes because it depends on the single top-ranked tool. The optimal P@1 ratio
-      may differ slightly from optimal MRR.
+      slot allocation because it depends on the single top-ranked tool.
     </p>
   </div>
 </div>
 
 <h3>Sweep Results (after {sweep_rounds} rounds)</h3>
 <p>
-  Each row shows final-round metrics for one weight configuration. The highlighted row has the
-  highest overall MRR. Note that pure semantic (1.0/0.0) is effectively the baseline &mdash;
-  historical signal has zero weight regardless of accumulated feedback.
+  Each row shows final-round metrics for one slot configuration. The highlighted row has the
+  highest overall MRR. Note that S5/H0 is effectively the baseline &mdash; no historical
+  slots are guaranteed regardless of accumulated feedback.
 </p>
 {sweep_table}
 
 <div class="note">
-  <strong>Interpretation:</strong> The sweep reveals how much weight the system can productively
-  give to historical feedback. If the optimal ratio shifts right of 0.6/0.4 with more rounds
-  (as the review index grows richer), it suggests the system would benefit from dynamic weight
-  scheduling &mdash; starting semantic-heavy and gradually increasing historical weight as
-  confidence in the feedback signal grows.
+  <strong>Interpretation:</strong> The holdout determines how many top-k slots are guaranteed from
+  each signal. The candidate pool is assembled with these guarantees, then reranked by a combined
+  score. Too few historical slots (left) means the system rarely surfaces historically-proven tools;
+  too few semantic slots (right) abandons the embedding prior, hurting cold-start and direct matches.
+  The optimal balance reflects how much the system can productively delegate to learned fitness.
 </div>
 """
 
@@ -590,11 +589,14 @@ def generate_html_report(
 </table>
 
 <div class="note">
-  <strong>Key takeaway:</strong> The adaptive system outperforms the semantic-only baseline across
-  all metrics, with the largest gains on Tier 3 (ambiguous) queries. This validates the core
-  hypothesis &mdash; historical fitness feedback provides the most value when tool descriptions
-  don&rsquo;t clearly distinguish candidates, and the system needs to learn from experience
-  which tool the agent actually wants.
+  <strong>Key takeaway:</strong> The adaptive system substantially outperforms the semantic-only
+  baseline on MRR and Precision, with the largest gains on Tier 3 (ambiguous) queries. Hit@5 may
+  decrease slightly because the holdout fusion replaces some semantic results with historically-proven
+  ones &mdash; the top-k is more focused but may miss a lower-ranked correct tool. This is the right
+  tradeoff: getting the #1 tool right matters more than having a correct tool somewhere in 5 options.
+  The results validate the core hypothesis &mdash; historical fitness feedback provides the most value
+  when tool descriptions don&rsquo;t clearly distinguish candidates, and the system needs to learn
+  from experience which tool the agent actually wants.
 </div>
 
 {sweep_section}
@@ -839,8 +841,8 @@ if (DATA.sweep) {{
   }}));
 
   groupedBarChart("#chart-sweep-mrr", {{
-    title: "Final MRR by Weight Ratio",
-    xLabel: "Semantic / Historical weight",
+    title: "Final MRR by Slot Holdout",
+    xLabel: "Semantic / Historical slots",
     groups: sweepGroups,
   }});
 
@@ -853,8 +855,8 @@ if (DATA.sweep) {{
   }}));
 
   groupedBarChart("#chart-sweep-p1", {{
-    title: "Final Precision@1 by Weight Ratio",
-    xLabel: "Semantic / Historical weight",
+    title: "Final Precision@1 by Slot Holdout",
+    xLabel: "Semantic / Historical slots",
     groups: sweepP1Groups,
   }});
 }}

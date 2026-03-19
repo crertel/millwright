@@ -9,10 +9,13 @@ class MillwrightConfig:
     embedding_model: str = "all-MiniLM-L6-v2"
     embedding_dim: int = 384
 
-    # Ranking
-    semantic_weight: float = 0.6
-    historical_weight: float = 0.4
+    # Ranking fusion (interleave with holdout)
     top_k: int = 5
+    min_semantic_slots: int = 2
+    min_historical_slots: int = 1
+
+    # Historical lookup
+    historical_similarity_threshold: float = 0.3
 
     # Exploration
     epsilon: float = 0.1
