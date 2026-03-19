@@ -1,27 +1,83 @@
-# Millwright Fidelity Fixes
+# Millwright Next Steps
 
-Ranked by impact on system behavior. Reference: [original post](https://minor.gripe/posts/2026-03-13-millwright_smarter_tool_selection_with_adaptive_toolsheds/).
+Reference: [original post](https://minor.gripe/posts/2026-03-13-millwright_smarter_tool_selection_with_adaptive_toolsheds/).
 
-## 1. ~~Fusion: interleave with holdout (not weighted sum)~~ DONE
+## Open
 
-Replaced weighted score sum with interleave fusion. `fuse_rankings` now takes `top_k`, `min_semantic_slots`, `min_historical_slots` — guarantees N slots from each signal, fills rest by interleaving. Config params: `min_semantic_slots=2`, `min_historical_slots=1`. Weight sweep replaced with slot holdout sweep.
+### Benchmark: fuzzy/overlapping tool categories
 
-## 2. ~~NONE sentinel logs unrelated for all presented tools~~ DONE
+The 200 synthetic tools have crisp, non-overlapping categories. Real catalogs have tools with ambiguous or multi-category membership. Adding intentionally misleading or overlapping descriptions would stress-test the feedback loop more realistically.
 
-`review_tools` now detects NONE in review list. When present, all presented tools not otherwise explicitly reviewed get an implicit `unrelated` entry logged.
+### Benchmark: distribution shift and catalog changes
 
-## 3. ~~Distance threshold on historical lookup~~ DONE
+Tools and queries are fixed for the entire run. No testing of stale reviews for removed tools, cold-start for newly added tools, or query distribution drift. Could add mid-benchmark tool additions/removals and novel queries in later rounds.
 
-Added `historical_similarity_threshold=0.3` to config. `historical_rank` skips index entries below threshold. Cuts noise from unrelated query regions.
+### Benchmark: real query decomposition
 
-## 4. ~~Compaction: weight fitness by distance to centroid~~ DONE
+The benchmark uses `MockDecomposer` (naive conjunction splitting). Per-subquery storage is mostly 1:1 with mock decomposition, so its value is untested. Options: add a mode using `ClaudeDecomposer` (requires API key), or use a cached/precomputed decomposition set.
 
-`compact_reviews` now computes cosine similarity of each review embedding to its cluster centroid and uses that as the weight when averaging fitness. Reviews near the center of a cluster have more influence.
+### Spec gap: "create custom tool" option
 
-## 5. Multi-round sessions with rejected-tool filtering — DONE (code only)
+The original post describes the ability for agents to create new tools when none of the suggestions fit. Not implemented.
 
-Added `excluded` param to `suggest_tools` and `continue_session` method to `Toolshed`. Both `semantic_rank` and `historical_rank` accept an `excluded` set. Not exercised by benchmark (single-shot per query) but the API is there.
+### Spec gap: shadow testing during compaction
 
-## 6. Per-subquery embedding storage — DONE
+The original post mentions validating the compacted index against the raw log to catch regressions. Not implemented.
 
-`review_tools` now stores one `ReviewEntry` per subquery embedding rather than collapsing to the mean. With MockDecomposer this is mostly 1:1, but the mechanism is correct for real decomposition.
+## Completed
+
+### Benchmark: train/test holdout split
+
+`--holdout 0.2` splits queries stratified by tier. Training queries get feedback; holdout queries are evaluate-only. Test metrics measure generalization separately from memorization.
+
+### Benchmark: multiple baselines (random, TF-IDF, semantic)
+
+`run_baselines()` evaluates random, TF-IDF cosine similarity, and semantic-only rankers alongside the adaptive system. `--no-baselines` to skip.
+
+### Benchmark: bootstrap CIs and significance tests
+
+Bootstrap confidence intervals (10k resamples) computed when `--seeds >= 3`. Paired Wilcoxon signed-rank test for adaptive vs. baseline. CI bands render on charts.
+
+### Benchmark: multi-turn session testing
+
+`--continuation-prob 0.3` exercises `continue_session()` when P@1 misses. Tracks multi-turn hit rate and rounds needed. Validates the rejected-tool filtering API.
+
+### Benchmark: compaction frequency sweep
+
+Sweeps compaction every 1/2/5/10/20 rounds. Shows that every 1–2 rounds is optimal; every 10+ degrades to no-learning baseline. `--no-compaction-sweep` to skip.
+
+### Benchmark: correlated noise model
+
+`--noise-model correlated` uses confusion pairs (file↔system, http↔cloud, database↔transform, crypto↔auth, messaging↔monitoring) with 3× degradation probability, modeling systematic agent errors.
+
+### Benchmark: report narrative separation
+
+Report no longer hardcodes interpretive text. Renders charts and tables only unless `--descriptions` provides a JSON file mapping section keys to prose.
+
+### Benchmark: JSON export
+
+`--results-json` saves all structured results for external analysis.
+
+### Fidelity: fusion with interleave holdout
+
+Replaced weighted score sum with interleave fusion. `fuse_rankings` guarantees N slots from each signal via `min_semantic_slots` / `min_historical_slots`, fills rest by interleaving.
+
+### Fidelity: NONE sentinel logs unrelated for all presented tools
+
+`review_tools` detects NONE in review list. All presented tools not otherwise reviewed get implicit `unrelated` entries.
+
+### Fidelity: distance threshold on historical lookup
+
+`historical_similarity_threshold=0.3` in config. `historical_rank` skips index entries below threshold.
+
+### Fidelity: compaction weights fitness by distance to centroid
+
+`compact_reviews` uses cosine similarity of each review embedding to its cluster centroid as weight when averaging fitness.
+
+### Fidelity: multi-round sessions with rejected-tool filtering
+
+`excluded` param on `suggest_tools` and `continue_session` method on `Toolshed`. Now exercised by benchmark via `--continuation-prob`.
+
+### Fidelity: per-subquery embedding storage
+
+`review_tools` stores one `ReviewEntry` per subquery embedding rather than collapsing to the mean.
